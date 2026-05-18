@@ -1,0 +1,4 @@
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+
+echo "bach: launching claude. Ctrl-Z to suspend, fg to resume, exit/Ctrl-D to leave."
+claude

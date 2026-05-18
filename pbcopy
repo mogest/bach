@@ -1,0 +1,26 @@
+#!/bin/sh
+# pbcopy(1) workalike for bach sessions: pipes stdin to the host clipboard via
+# the OSC 52 terminal escape. Requires the user's terminal to support OSC 52
+# clipboard writes (iTerm2, Ghostty, kitty, WezTerm, Alacritty, recent
+# Terminal.app — usually enabled by default; some need an explicit setting).
+#
+# Limits: OSC 52 payload caps vary by terminal (often ~75 KB after base64).
+# Larger inputs may be silently truncated by the terminal.
+set -eu
+
+b64=$(base64 | tr -d '\r\n')
+
+# tmux/screen need a passthrough wrapper to forward the sequence to the outer
+# terminal. Without it the multiplexer eats the OSC 52.
+case "${TERM:-}" in
+    screen*|tmux*) seq=$(printf '\033Ptmux;\033\033]52;c;%s\007\033\\' "$b64") ;;
+    *)             seq=$(printf '\033]52;c;%s\a' "$b64") ;;
+esac
+
+# Write to /dev/tty so piping (data | pbcopy) still reaches the terminal even
+# when stdout is captured. Fall back to stderr if there's no controlling tty.
+if [ -w /dev/tty ]; then
+    printf '%s' "$seq" > /dev/tty
+else
+    printf '%s' "$seq" >&2
+fi

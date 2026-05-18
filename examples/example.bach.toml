@@ -1,0 +1,42 @@
+# Example bach config.
+# Place at the repo root as `.bach.toml`.
+#
+# After `bach`, in the container, services are reachable by short name
+# (postgres, redis, etc.) via /etc/hosts entries bach injects.
+
+# Forwarded ports. bach picks a free host port starting at 4100; the proxy
+# dashboard shows the assigned URL. Add more entries (e.g. esbuild HMR,
+# LiveDashboard) as needed.
+[[ports]]
+name = "web"
+container = 4000
+
+# Persistent named volume for mise's tool cache, shared across all bach
+# projects so identical tool versions only download once. Set to false to
+# disable (each session starts from a clean mise state).
+mise_cache = true
+
+[services.postgres]
+image = "postgres:16-alpine"
+env = { POSTGRES_USER = "postgres", POSTGRES_PASSWORD = "postgres", POSTGRES_DB = "app_dev" }
+volumes = ["postgres-data:/var/lib/postgresql/data"]
+
+[services.redis]
+image = "redis:7-alpine"
+volumes = ["redis-data:/data"]
+
+[services.dynamodb]
+# amazon/dynamodb-local supports linux/arm64 since 2.x.
+image = "amazon/dynamodb-local:latest"
+command = ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "./data"]
+volumes = ["dynamodb-data:/home/dynamodblocal/data"]
+
+[services.rustfs]
+image = "rustfs/rustfs:latest"
+env = { RUSTFS_ACCESS_KEY = "abcd", RUSTFS_SECRET_KEY = "12345678", RUSTFS_VOLUMES = "/data" }
+volumes = ["rustfs-data:/data"]
+
+# Private image example. Requires `gh auth login` on the host; bach reuses
+# the token to `docker login ghcr.io` once per process.
+# [services.myservice]
+# image = "ghcr.io/myorg/myservice:latest"

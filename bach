@@ -1,0 +1,1931 @@
+#!/usr/bin/env python3
+"""bach — sandboxed claude in a microVM (Apple container) or Linux container (Docker)."""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import threading
+import hashlib
+import json
+import os
+import pathlib
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import textwrap
+import time
+import tomllib
+import urllib.error
+import urllib.request
+
+XDG_DATA = pathlib.Path(os.environ.get("XDG_DATA_HOME") or pathlib.Path.home() / ".local" / "share")
+XDG_STATE = pathlib.Path(os.environ.get("XDG_STATE_HOME") or pathlib.Path.home() / ".local" / "state")
+XDG_CONFIG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
+BACH_DATA = XDG_DATA / "bach"
+BACH_STATE = XDG_STATE / "bach"
+USER_CONFIG_PATH = XDG_CONFIG / "bach" / "config.toml"
+BACH_REPO = pathlib.Path(__file__).resolve().parent
+DEFAULT_IMAGE = "bach:base"
+PROXY_CONTAINER = "bach-proxy"
+PROXY_IMAGE = "bach-proxy:latest"
+INTERNET_NET = "bach-internet"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+MISE_CACHE_HOST = BACH_DATA / "cache" / "mise"
+PROJECTS_HOST = BACH_DATA / "projects"
+PORTS_STATE_FILE = BACH_STATE / "ports.json"
+# Range pre-published on the bach-proxy container at startup. Session
+# containers live on --internal networks (Docker silently no-ops port
+# publishing there), so host->container traffic enters via the dual-homed
+# proxy and is TCP-forwarded by it. Keep this aligned with the publish
+# range used in DockerBackend.ensure_proxy.
+PORT_ALLOC_START = 4100
+PORT_ALLOC_END = 4199
+
+# ---------- project + config ----------
+
+# Keys that are concatenated when layering user-level config under the
+# project's .bach.toml. Everything else either merges by key (services / env /
+# aliases) or last-writer-wins (scalars).
+_CONCAT_KEYS = {"apt_packages", "ports", "allowlist", "denylist", "stage", "mounts", "cache", "volumes", "install"}
+_TABLE_KEYS = {"env", "aliases", "services"}
+
+def merge_configs(base: dict, override: dict) -> dict:
+    """Layer `override` on top of `base`. Both inputs untouched. Rules:
+      - lists in _CONCAT_KEYS concat (base first, then override).
+      - tables in _TABLE_KEYS merge by key, later wins per key. For `services`
+        this means a name collision fully replaces the base service spec — no
+        deep merge of env/volumes/etc., to keep the mental model simple.
+      - everything else: later wins."""
+    out = dict(base)
+    for k, v in override.items():
+        if k in _CONCAT_KEYS:
+            out[k] = list(out.get(k, []) or []) + list(v or [])
+        elif k in _TABLE_KEYS:
+            merged = dict(out.get(k, {}) or {})
+            for subk, subv in (v or {}).items():
+                merged[subk] = subv
+            out[k] = merged
+        else:
+            out[k] = v
+    return out
+
+def load_user_config() -> dict:
+    """Load ~/.config/bach/config.toml (or $XDG_CONFIG_HOME/bach/config.toml)
+    if present. Silently absent otherwise. Same schema as .bach.toml; layered
+    under it (project wins on conflicts; see merge_configs)."""
+    if not USER_CONFIG_PATH.exists():
+        return {}
+    with USER_CONFIG_PATH.open("rb") as f:
+        return tomllib.load(f)
+
+# Proxy ports are intentionally user-level only — one proxy serves all
+# projects, so it must bind the same ports regardless of which project
+# spawned it. Read from the user config (not the merged config) so a
+# project's `.bach.toml` can't accidentally desynchronise the proxy
+# listener from the HTTP_PROXY URL handed to session containers.
+def _load_proxy_ports() -> tuple[int, int]:
+    cfg = load_user_config()
+    return int(cfg.get("proxy_port", 8080)), int(cfg.get("proxy_dash_port", 8081))
+
+PROXY_PORT, PROXY_DASH_PORT = _load_proxy_ports()
+
+def find_project() -> tuple[pathlib.Path, dict]:
+    cwd = pathlib.Path.cwd().resolve()
+    user_cfg = load_user_config()
+    for d in [cwd, *cwd.parents]:
+        cfg_path = d / ".bach.toml"
+        if cfg_path.exists():
+            with cfg_path.open("rb") as f:
+                project_cfg = tomllib.load(f)
+            return d, merge_configs(user_cfg, project_cfg)
+    return cwd, user_cfg
+
+def project_id(root: pathlib.Path) -> str:
+    return "bach-" + re.sub(r"[^a-z0-9-]+", "-", root.name.lower()).strip("-")
+
+def cn(root: pathlib.Path, suffix: str) -> str:
+    return f"{project_id(root)}-{suffix}"
+
+def set_window_title(title: str) -> dict | None:
+    """Set the terminal/tmux window title for the duration of a session.
+    Returns an opaque state dict to pass to `restore_window_title`, or None
+    if stdout isn't a TTY (in which case restoration is a no-op).
+
+    Inside tmux, OSC title escapes are filtered by default (allow-rename
+    off), so we shell out to `tmux rename-window` and remember the previous
+    name + automatic-rename setting for restoration. Outside tmux, we use
+    OSC 22;0t / 0; / 23;0t (save title to stack, set, pop)."""
+    if not sys.stdout.isatty():
+        return None
+    if os.environ.get("TMUX"):
+        try:
+            prev_name = subprocess.run(
+                ["tmux", "display-message", "-p", "#W"],
+                capture_output=True, text=True, check=True,
+            ).stdout.rstrip("\n")
+            prev_auto = subprocess.run(
+                ["tmux", "show-window-options", "-v", "automatic-rename"],
+                capture_output=True, text=True,
+            ).stdout.strip() or "off"
+            subprocess.run(["tmux", "rename-window", title], check=False)
+            return {"kind": "tmux", "name": prev_name, "auto": prev_auto}
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return None
+    sys.stdout.write(f"\033[22;0t\033]0;{title}\07")
+    sys.stdout.flush()
+    return {"kind": "osc"}
+
+def restore_window_title(state: dict | None) -> None:
+    if not state:
+        return
+    try:
+        if state["kind"] == "tmux":
+            subprocess.run(["tmux", "rename-window", state["name"]], check=False)
+            if state["auto"] == "on":
+                subprocess.run(
+                    ["tmux", "set-window-option", "automatic-rename", "on"],
+                    check=False,
+                )
+        else:
+            sys.stdout.write("\033[23;0t")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+def vol_name(root: pathlib.Path, vol: str) -> str:
+    return f"{project_id(root)}-{vol}"
+
+def register_project_with_proxy(
+    root: pathlib.Path,
+    cfg: dict,
+    backend: Backend,
+    net: str,
+    ports: list[dict] | None = None,
+) -> None:
+    """POST the project's source CIDR + allowlist (+ port allocations) to
+    the bach-proxy so it can map incoming connections back to a project
+    and render the dashboard's port table. Best-effort: warns and
+    continues on failure (the proxy may not be running on a status/log
+    call, or may not yet have accepted connections after a fresh start)."""
+    try:
+        cidr = backend.network_cidr(net)
+    except (RuntimeError, KeyError) as e:
+        print(f"bach: warning: could not resolve {net} CIDR: {e}", file=sys.stderr)
+        return
+    allowlist = cfg.get("allowlist") or []
+    if not isinstance(allowlist, list) or not all(isinstance(h, str) for h in allowlist):
+        print("bach: warning: .bach.toml `allowlist` must be a list of strings; ignoring", file=sys.stderr)
+        allowlist = []
+    denylist = cfg.get("denylist") or []
+    if not isinstance(denylist, list) or not all(isinstance(h, str) for h in denylist):
+        print("bach: warning: .bach.toml `denylist` must be a list of strings; ignoring", file=sys.stderr)
+        denylist = []
+    payload = {"name": root.name, "cidr": cidr, "allowlist": allowlist, "denylist": denylist}
+    if ports is not None:
+        payload["ports"] = ports
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PROXY_DASH_PORT}/project",
+        data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            resp.read()
+    except (urllib.error.URLError, OSError) as e:
+        print(f"bach: warning: project registration failed: {e}", file=sys.stderr)
+
+
+def post_forwards_to_proxy(project: str, forwards: list[dict]) -> None:
+    """Push the project's TCP forwards to bach-proxy. Each forward is
+    {host_port, container_ip, container_port}. The proxy starts/stops
+    listeners to match the union of all projects' forwards."""
+    body = json.dumps({"project": project, "forwards": forwards}).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PROXY_DASH_PORT}/forwards",
+        data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            resp.read()
+    except (urllib.error.URLError, OSError) as e:
+        print(f"bach: warning: forwards registration failed: {e}", file=sys.stderr)
+
+
+def build_forwards(allocations: list[dict], project: str, ip_lookup) -> list[dict]:
+    """Convert live allocations for `project` into the proxy's forwards
+    schema. `ip_lookup(session_name) -> ip|None` is called once per unique
+    session. Allocations whose session lacks an IP yet are dropped (caller
+    can retry)."""
+    ip_cache: dict[str, str | None] = {}
+    out: list[dict] = []
+    for a in allocations:
+        if a.get("project") != project:
+            continue
+        session = a.get("session")
+        if session not in ip_cache:
+            ip_cache[session] = ip_lookup(session)
+        ip = ip_cache[session]
+        if not ip:
+            continue
+        out.append({
+            "host_port": a["host_port"],
+            "container_ip": ip,
+            "container_port": a["container_port"],
+        })
+    return out
+
+
+# ---------- shell helpers ----------
+
+def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, capture_output=capture, text=True)
+
+def ok(cmd: list[str]) -> bool:
+    return subprocess.run(cmd, capture_output=True).returncode == 0
+
+def host_port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
+# ---------- port allocation ----------
+#
+# State lives at ~/.local/state/bach/ports.json. Each entry binds one
+# (project, session, name) tuple to a host port; sticky-when-free per
+# (project, name) across restarts. Concurrent sessions for the same
+# project get distinct ports (next free from PORT_ALLOC_START up).
+#
+# Lifetime: bach's cleanup handler removes its own session's entries on
+# exit; every bach invocation reaps entries whose session container is
+# no longer running as a safety net for SIGKILL'd or otherwise-dead
+# parents.
+
+def parse_ports(cfg: dict) -> list[dict]:
+    """Validate and normalize the [[ports]] entries from .bach.toml.
+    Each entry: name (str), container (int), optional host (int) pin,
+    optional scheme ("http"|"https", default "http")."""
+    raw = cfg.get("ports") or []
+    if not isinstance(raw, list):
+        print("bach: warning: .bach.toml `ports` must be a list of tables; ignoring", file=sys.stderr)
+        return []
+    out: list[dict] = []
+    seen_names: set[str] = set()
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            print(f"bach: warning: ports[{i}] is not a table; ignoring", file=sys.stderr)
+            continue
+        name = entry.get("name")
+        container = entry.get("container")
+        if not isinstance(name, str) or not name:
+            print(f"bach: warning: ports[{i}] missing/invalid `name`; ignoring", file=sys.stderr)
+            continue
+        if not isinstance(container, int):
+            print(f"bach: warning: ports[{name}] missing/invalid `container`; ignoring", file=sys.stderr)
+            continue
+        if name in seen_names:
+            print(f"bach: warning: ports[{name}] duplicate name; ignoring", file=sys.stderr)
+            continue
+        seen_names.add(name)
+        host = entry.get("host")
+        if host is not None and not isinstance(host, int):
+            print(f"bach: warning: ports[{name}].host must be int; treating as auto", file=sys.stderr)
+            host = None
+        scheme = entry.get("scheme", "http")
+        if scheme not in ("http", "https"):
+            print(f"bach: warning: ports[{name}].scheme must be http|https; defaulting to http", file=sys.stderr)
+            scheme = "http"
+        out.append({"name": name, "container": container, "host": host, "scheme": scheme})
+    return out
+
+
+@contextlib.contextmanager
+def _ports_state_lock():
+    """Exclusive lock on the ports state file for read-modify-write."""
+    BACH_STATE.mkdir(parents=True, exist_ok=True)
+    lockf = BACH_STATE / "ports.lock"
+    fd = os.open(str(lockf), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _load_ports_state() -> dict:
+    if not PORTS_STATE_FILE.exists():
+        return {"version": 1, "allocations": []}
+    try:
+        with PORTS_STATE_FILE.open() as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"version": 1, "allocations": []}
+    if not isinstance(data, dict) or "allocations" not in data:
+        return {"version": 1, "allocations": []}
+    return data
+
+
+def _save_ports_state(state: dict) -> None:
+    BACH_STATE.mkdir(parents=True, exist_ok=True)
+    tmp = PORTS_STATE_FILE.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, PORTS_STATE_FILE)
+
+
+def reap_ports(running_sessions: set[str]) -> dict:
+    """Drop allocations whose session is no longer running. Returns the
+    pruned state. `running_sessions` is the set of session container
+    names across all projects."""
+    with _ports_state_lock():
+        state = _load_ports_state()
+        before = len(state.get("allocations", []))
+        state["allocations"] = [
+            a for a in state.get("allocations", [])
+            if a.get("session") in running_sessions
+        ]
+        if len(state["allocations"]) != before:
+            _save_ports_state(state)
+        return state
+
+
+def allocate_ports(
+    project: str,
+    session: str,
+    ports: list[dict],
+    running_sessions: set[str],
+) -> list[dict]:
+    """Reap dead allocations, then assign a host port to each requested
+    port. Sticky-when-free per (project, name) across restarts. Returns
+    allocations with `host_port` filled in. Logs to stderr when the
+    assigned port differs from a prior sticky choice."""
+    if not ports:
+        return []
+    with _ports_state_lock():
+        state = _load_ports_state()
+        allocs = [a for a in state.get("allocations", []) if a.get("session") in running_sessions]
+
+        live_host_ports: set[int] = {a["host_port"] for a in allocs}
+
+        # Last-known sticky port per (project, name) — most recent entry wins.
+        sticky: dict[tuple[str, str], int] = {}
+        for a in state.get("allocations", []):
+            sticky[(a.get("project", ""), a.get("name", ""))] = a.get("host_port", 0)
+
+        def pick_free(start: int, prefer: int | None = None) -> int | None:
+            # The forwarder range is published wholesale by bach-proxy, so we
+            # don't care about host-port "free"-ness — only that no other live
+            # bach session has the slot.
+            if prefer is not None and prefer not in live_host_ports:
+                return prefer
+            for p in range(start, PORT_ALLOC_END + 1):
+                if p in live_host_ports:
+                    continue
+                return p
+            return None
+
+        out: list[dict] = []
+        for p in ports:
+            name = p["name"]
+            preferred = sticky.get((project, name))
+            chosen: int | None = None
+            if p.get("host") is not None:
+                pin = p["host"]
+                if pin < PORT_ALLOC_START or pin > PORT_ALLOC_END:
+                    print(
+                        f"bach: port '{name}' pinned to {pin} outside forwarder range "
+                        f"[{PORT_ALLOC_START},{PORT_ALLOC_END}]; skipping",
+                        file=sys.stderr,
+                    )
+                    continue
+                if pin in live_host_ports:
+                    print(f"bach: port '{name}' pinned to {pin} but already in use by another session; skipping",
+                          file=sys.stderr)
+                    continue
+                chosen = pin
+            else:
+                chosen = pick_free(PORT_ALLOC_START, prefer=preferred)
+                if chosen is None:
+                    print(f"bach: no free host port for '{name}' in [{PORT_ALLOC_START},{PORT_ALLOC_END}]; skipping",
+                          file=sys.stderr)
+                    continue
+                if preferred and chosen != preferred:
+                    print(f"bach: port '{name}' -> {chosen} (sticky {preferred} unavailable)", file=sys.stderr)
+
+            live_host_ports.add(chosen)
+            alloc = {
+                "project": project,
+                "session": session,
+                "name": name,
+                "container_port": p["container"],
+                "host_port": chosen,
+                "scheme": p.get("scheme", "http"),
+            }
+            allocs.append(alloc)
+            out.append(alloc)
+
+        state["allocations"] = allocs
+        _save_ports_state(state)
+        return out
+
+
+def release_session_ports(session: str) -> list[dict]:
+    """Remove this session's port entries. Returns the remaining state's
+    allocations (caller may want them to re-POST to the proxy)."""
+    with _ports_state_lock():
+        state = _load_ports_state()
+        state["allocations"] = [a for a in state.get("allocations", []) if a.get("session") != session]
+        _save_ports_state(state)
+        return state["allocations"]
+
+
+def project_port_map(allocations: list[dict], project: str) -> list[dict]:
+    """Subset of allocations for one project, in dashboard-shape. `session`
+    is the short hex suffix of the session container name (e.g. `a1b2c3d4`)
+    so the dashboard can disambiguate concurrent sessions for the same
+    project + port name."""
+    def short_session(name: str) -> str:
+        marker = "-session-"
+        i = name.rfind(marker)
+        return name[i + len(marker):] if i >= 0 else name
+
+    return [
+        {
+            "name": a["name"],
+            "session": short_session(a.get("session", "")),
+            "host_port": a["host_port"],
+            "container_port": a["container_port"],
+            "scheme": a.get("scheme", "http"),
+        }
+        for a in allocations if a.get("project") == project
+    ]
+
+
+def image_registry(image: str) -> str:
+    """Return the registry hostname for an image reference, or "docker.io"
+    when implicit. Mirrors Docker/OCI ref resolution: an explicit registry
+    requires a `/`, and the first path component must contain `.` or `:` or
+    be literal `localhost`. Single-segment refs like `postgres:16-alpine`
+    are Docker Hub (the `:` is the tag)."""
+    if "/" not in image:
+        return "docker.io"
+    first = image.split("/", 1)[0]
+    if "." in first or ":" in first or first == "localhost":
+        return first
+    return "docker.io"
+
+def to_https_remote(url: str) -> str:
+    """Rewrite ssh-style remotes to https. Inside the sandbox SSH can't reach
+    GitHub (no key, no ssh path through the proxy), but https + GH_TOKEN + the
+    `gh auth git-credential` helper does Just Work."""
+    if not url:
+        return url
+    m = re.match(r"^git@([^:]+):(.+)$", url)
+    if m:
+        return f"https://{m.group(1)}/{m.group(2)}"
+    m = re.match(r"^ssh://git@([^/]+)/(.+)$", url)
+    if m:
+        return f"https://{m.group(1)}/{m.group(2)}"
+    return url
+
+def host_gh_token() -> str | None:
+    """Return the host's `gh auth token` if available. Used to propagate the
+    user's GitHub auth into every session as GH_TOKEN, so `gh` and `git push`
+    over HTTPS work without bind-mounting host config. Silent if gh is absent
+    or the user isn't logged in — github access is optional."""
+    if shutil.which("gh") is None:
+        return None
+    res = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
+    if res.returncode != 0:
+        return None
+    return res.stdout.strip() or None
+
+def host_git_identity(root: pathlib.Path) -> tuple[str | None, str | None]:
+    """Return (user.name, user.email) from the host git config so commits
+    authored inside a session show the same identity as on the host. Resolves
+    from `root` so per-repo overrides and `includeIf` directives keyed on the
+    project path apply; missing values are returned as None and skipped."""
+    if shutil.which("git") is None:
+        return None, None
+    def read(key: str) -> str | None:
+        res = subprocess.run(
+            ["git", "config", "--get", key],
+            cwd=str(root), capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            return None
+        v = res.stdout.strip()
+        return v or None
+    return read("user.name"), read("user.email")
+
+def gh_token_for(host: str) -> tuple[str, str]:
+    """Return (username, token) for `host` (currently only ghcr.io) via the
+    host's `gh` CLI. Raises with a clear message on failure."""
+    if shutil.which("gh") is None:
+        raise RuntimeError(
+            f"need {host} auth but `gh` CLI is not installed. "
+            "Install gh and run `gh auth login` (with read:packages scope)."
+        )
+    tok = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
+    token = tok.stdout.strip()
+    if tok.returncode != 0 or not token:
+        raise RuntimeError(
+            f"could not get GitHub token via `gh auth token` for {host} login. "
+            "Run `gh auth login` (or `gh auth refresh -s read:packages`)."
+        )
+    who = subprocess.run(["gh", "api", "user", "-q", ".login"], capture_output=True, text=True)
+    username = who.stdout.strip() or "x-access-token"
+    return username, token
+
+# ---------- backend abstraction ----------
+
+class Backend:
+    """Abstract container backend. Apple `container` or Docker."""
+    name: str = ""
+    cli: str = ""
+
+    def inspect(self, kind: str, name: str) -> dict | None:
+        raise NotImplementedError
+
+    def network_exists(self, net: str) -> bool:
+        return self.inspect("network", net) is not None
+
+    def ensure_network(self, net: str) -> None:
+        raise NotImplementedError
+
+    def ensure_volume(self, name: str) -> None:
+        if self.inspect("volume", name) is None:
+            run([self.cli, "volume", "create", name])
+
+    def chown_volume(self, name: str, owner: str) -> None:
+        """Chown the volume contents to `owner` (e.g. "1000:1000") via a
+        one-shot alpine container. Needed when a service runs as non-root
+        but the image's volume dir is shipped root-owned (dynamodb-local
+        on Docker, most volumes on Apple)."""
+        run([
+            self.cli, "run", "--rm",
+            "--mount", f"type=volume,source={name},target=/v",
+            "alpine:latest",
+            "chown", "-R", owner, "/v",
+        ], check=False)
+
+    def container_state(self, name: str) -> str:
+        raise NotImplementedError
+
+    def container_ip(self, name: str, net: str | None = None) -> str | None:
+        raise NotImplementedError
+
+    def image_inspect(self, ref: str) -> dict | None:
+        return self.inspect("image", ref)
+
+    def image_digest(self, ref: str) -> str:
+        """Stable id for a local image, used to invalidate per-project image
+        caches when the base image is rebuilt. Empty string if missing."""
+        raise NotImplementedError
+
+    def image_build(self, tag: str, build_dir: pathlib.Path) -> None:
+        run([self.cli, "build", "-t", tag, str(build_dir)])
+
+    def ensure_registry_auth(self, image: str) -> None:
+        """Log into the image's registry on the host if needed. Per-process
+        cached to avoid repeated `gh` calls."""
+
+    def injects_hosts(self) -> bool:
+        """True if service-name DNS doesn't work natively and bach must
+        write /etc/hosts entries via BACH_HOSTS env."""
+        return False
+
+    def proxy_host(self, net: str) -> str:
+        """Hostname/IP the session container should use for HTTPS_PROXY."""
+        raise NotImplementedError
+
+    def ensure_proxy(self, net: str) -> None:
+        """Start (or ensure-running) the proxy reachable at proxy_host(net)."""
+        raise NotImplementedError
+
+    def stop_proxy(self) -> None:
+        pass
+
+    def proxy_status(self) -> str:
+        return "unknown"
+
+    def proxy_log_cmd(self) -> list[str] | None:
+        return None
+
+    def network_cidr(self, net: str) -> str:
+        """Return the IPv4 subnet (`a.b.c.d/n`) of an existing project network.
+        Used to register the project's source CIDR with the bach-proxy so it
+        can map incoming connections back to a project + allowlist."""
+        raise NotImplementedError
+
+    def list_running_sessions(self, project_id: str) -> list[str]:
+        """Names of running session containers for a project. Filters by
+        the labels stamped onto every session container in `session()`."""
+        raise NotImplementedError
+
+    def list_all_running_sessions(self) -> list[str]:
+        """Names of all running bach session containers across all projects.
+        Used by the port reaper to drop stale allocations."""
+        raise NotImplementedError
+
+
+# ---------- Apple `container` backend ----------
+
+class AppleBackend(Backend):
+    name = "apple"
+    cli = "container"
+
+    def inspect(self, kind: str, name: str) -> dict | None:
+        # `container inspect <name>` for containers; `container <kind> inspect <name>` otherwise.
+        cmd = [self.cli, "inspect", name] if kind == "container" else [self.cli, kind, "inspect", name]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            return None
+        try:
+            data = json.loads(res.stdout)
+            return data[0] if data else None
+        except (json.JSONDecodeError, IndexError):
+            return None
+
+    def ensure_network(self, net: str) -> None:
+        if not self.network_exists(net):
+            run([self.cli, "network", "create", "--internal", net])
+
+    def container_state(self, name: str) -> str:
+        data = self.inspect("container", name)
+        if data is None:
+            return "absent"
+        return data.get("status", "stopped")
+
+    def container_ip(self, name: str, net: str | None = None) -> str | None:
+        data = self.inspect("container", name)
+        if not data:
+            return None
+        for n in data.get("networks", []):
+            addr = n.get("ipv4Address")
+            if addr:
+                return addr.split("/")[0]
+        return None
+
+    def image_digest(self, ref: str) -> str:
+        info = self.image_inspect(ref) or {}
+        return (info.get("index") or {}).get("digest", "")
+
+    def ensure_registry_auth(self, image: str) -> None:
+        # Apple container has a known upstream keychain bug (apple/container#1253,
+        # PR #1257) that breaks pulls after registry login. Implementation
+        # mirrors the Docker path for when that lands; today it's effectively
+        # unusable for private images.
+        host = image_registry(image)
+        if host in _apple_authed:
+            return
+        if host != "ghcr.io":
+            return
+        res = subprocess.run([self.cli, "registry", "list"], capture_output=True, text=True)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines()[1:]:
+                if line.split()[:1] == [host]:
+                    _apple_authed.add(host)
+                    return
+        username, token = gh_token_for(host)
+        print(f"bach: logging in to {host} as {username}")
+        res = subprocess.run(
+            [self.cli, "registry", "login", "-u", username, "--password-stdin", host],
+            input=token, capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"`container registry login {host}` failed: "
+                f"{(res.stderr or res.stdout).strip()}"
+            )
+        _apple_authed.add(host)
+
+    def injects_hosts(self) -> bool:
+        return True
+
+    def proxy_host(self, net: str) -> str:
+        data = self.inspect("network", net)
+        if data is None:
+            raise RuntimeError(f"apple network {net} missing")
+        return data["status"]["ipv4Gateway"]
+
+    def network_cidr(self, net: str) -> str:
+        data = self.inspect("network", net)
+        if data is None:
+            raise RuntimeError(f"apple network {net} missing")
+        status = data.get("status") or {}
+        for key in ("ipv4Subnet", "subnet", "cidr", "ipv4Range"):
+            v = status.get(key)
+            if v:
+                return v
+        raise RuntimeError(
+            f"no subnet on apple network {net} (status keys: {list(status.keys())})"
+        )
+
+    # Host-side bach-proxy (Go). Built from BACH_REPO/proxy on first run.
+    def ensure_proxy(self, net: str) -> None:
+        if self._proxy_pid():
+            return
+        BACH_STATE.mkdir(parents=True, exist_ok=True)
+        bin_path = self._ensure_proxy_binary()
+        log_path = BACH_STATE / "proxy.log"
+        err_path = BACH_STATE / "proxy.err"
+        env = os.environ.copy()
+        # Dashboard listens on host loopback; sessions can only reach the proxy
+        # itself via the per-project network gateway.
+        env["BACH_PROXY_LISTEN"] = f":{PROXY_PORT}"
+        env["BACH_DASH_LISTEN"] = f"127.0.0.1:{PROXY_DASH_PORT}"
+        env["BACH_DASH_ALLOW_CIDR"] = "127.0.0.0/8"
+        log_f = open(log_path, "a")
+        err_f = open(err_path, "w")
+        proc = subprocess.Popen(
+            [str(bin_path)],
+            stdout=log_f,
+            stderr=err_f,
+            env=env,
+            start_new_session=True,
+        )
+        (BACH_STATE / "proxy.pid").write_text(str(proc.pid))
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"bach-proxy exited (status {proc.returncode}); see {err_path}")
+            try:
+                with socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=0.2):
+                    print(f"bach: proxy started (pid {proc.pid})  dashboard http://127.0.0.1:{PROXY_DASH_PORT}/")
+                    return
+            except OSError:
+                time.sleep(0.2)
+        raise RuntimeError(f"bach-proxy didn't open port within 15s; see {err_path}")
+
+    def _ensure_proxy_binary(self) -> pathlib.Path:
+        src_dir = BACH_REPO / "proxy"
+        bin_dir = BACH_STATE / "proxy-bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        bin_path = bin_dir / "bach-proxy"
+        src = src_dir / "main.go"
+        if bin_path.exists() and bin_path.stat().st_mtime >= src.stat().st_mtime:
+            return bin_path
+        if shutil.which("go") is None:
+            raise RuntimeError(
+                "`go` is required to build the bach proxy on the Apple backend. "
+                "Install Go (e.g. `brew install go`) and rerun."
+            )
+        print(f"bach: building bach-proxy -> {bin_path}")
+        res = subprocess.run(
+            ["go", "build", "-trimpath", "-ldflags=-s -w", "-o", str(bin_path), "."],
+            cwd=src_dir, capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"go build failed: {(res.stderr or res.stdout).strip()}")
+        return bin_path
+
+    def stop_proxy(self) -> None:
+        pid_file = BACH_STATE / "proxy.pid"
+        if not pid_file.exists():
+            return
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+        pid_file.unlink(missing_ok=True)
+
+    def proxy_status(self) -> str:
+        pid = self._proxy_pid()
+        if pid:
+            return f"running pid {pid}  dashboard http://127.0.0.1:{PROXY_DASH_PORT}/"
+        return "not running"
+
+    def proxy_log_cmd(self) -> list[str] | None:
+        log = BACH_STATE / "proxy.log"
+        if not log.exists():
+            return None
+        return ["tail", "-50", str(log)]
+
+    def _proxy_pid(self) -> int | None:
+        pid_file = BACH_STATE / "proxy.pid"
+        if not pid_file.exists():
+            return None
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            with socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=0.5):
+                return pid
+        except (OSError, ValueError):
+            pid_file.unlink(missing_ok=True)
+            return None
+
+    def list_running_sessions(self, project_id: str) -> list[str]:
+        # Apple `container ls` lacks docker's --filter label= syntax.
+        # Fall back to name-prefix matching, which is reliable because
+        # session() names every session container `cn(root, "session-<hex>")`.
+        prefix = f"{project_id}-session-"
+        res = subprocess.run(
+            [self.cli, "ls", "--format", "json"],
+            capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            return []
+        try:
+            data = json.loads(res.stdout or "[]")
+        except json.JSONDecodeError:
+            return []
+        names: list[str] = []
+        for entry in data:
+            cfg = entry.get("configuration") or {}
+            name = cfg.get("id") or entry.get("id") or ""
+            status = entry.get("status", "")
+            if name.startswith(prefix) and status == "running":
+                names.append(name)
+        return names
+
+    def list_all_running_sessions(self) -> list[str]:
+        # `container ls` doesn't filter by label; match `bach-<proj>-session-<hex>`
+        # by name structure.
+        res = subprocess.run(
+            [self.cli, "ls", "--format", "json"],
+            capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            return []
+        try:
+            data = json.loads(res.stdout or "[]")
+        except json.JSONDecodeError:
+            return []
+        names: list[str] = []
+        for entry in data:
+            cfg = entry.get("configuration") or {}
+            name = cfg.get("id") or entry.get("id") or ""
+            status = entry.get("status", "")
+            if status != "running":
+                continue
+            if re.match(r"^bach-[a-z0-9-]+-session-[0-9a-f]+$", name):
+                names.append(name)
+        return names
+
+
+# ---------- Docker backend ----------
+
+class DockerBackend(Backend):
+    name = "docker"
+    cli = "docker"
+
+    def inspect(self, kind: str, name: str) -> dict | None:
+        # `docker inspect` handles all kinds; passing --type guards against
+        # collisions between e.g. a volume and a container of the same name.
+        cmd = [self.cli, kind, "inspect", name] if kind in ("network", "volume") else [self.cli, "inspect", name]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            return None
+        try:
+            data = json.loads(res.stdout)
+            return data[0] if data else None
+        except (json.JSONDecodeError, IndexError):
+            return None
+
+    def ensure_network(self, net: str) -> None:
+        if not self.network_exists(net):
+            run([self.cli, "network", "create", "--internal", net])
+
+    def container_state(self, name: str) -> str:
+        data = self.inspect("container", name)
+        if data is None:
+            return "absent"
+        s = (data.get("State") or {}).get("Status", "")
+        # Docker statuses: running, exited, created, paused, restarting, dead.
+        return "running" if s == "running" else ("absent" if s == "" else "stopped")
+
+    def container_ip(self, name: str, net: str | None = None) -> str | None:
+        data = self.inspect("container", name)
+        if not data:
+            return None
+        nets = (data.get("NetworkSettings") or {}).get("Networks") or {}
+        if net and net in nets:
+            return nets[net].get("IPAddress") or None
+        # Fall back to any attached network.
+        for cfg in nets.values():
+            if cfg.get("IPAddress"):
+                return cfg["IPAddress"]
+        return None
+
+    def image_digest(self, ref: str) -> str:
+        info = self.image_inspect(ref) or {}
+        return info.get("Id", "")
+
+    def ensure_registry_auth(self, image: str) -> None:
+        host = image_registry(image)
+        if host in _docker_authed:
+            return
+        if host != "ghcr.io":
+            # Docker Hub and others either don't need auth or are configured
+            # by the user out-of-band.
+            return
+        # Don't trust ~/.docker/config.json: an empty `auths.ghcr.io: {}`
+        # only signals a prior login and may map to a stale/missing credential
+        # via the cred helper. Re-login from `gh auth token` is idempotent and
+        # cheap; do it once per process.
+        username, token = gh_token_for(host)
+        print(f"bach: logging in to {host} as {username}")
+        res = subprocess.run(
+            [self.cli, "login", host, "-u", username, "--password-stdin"],
+            input=token, capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"`docker login {host}` failed: {(res.stderr or res.stdout).strip()}"
+            )
+        _docker_authed.add(host)
+
+    def injects_hosts(self) -> bool:
+        return False
+
+    def proxy_host(self, net: str) -> str:
+        # The proxy container is joined to every project network and is
+        # reachable by container name via Docker's bridge DNS.
+        return PROXY_CONTAINER
+
+    def ensure_proxy(self, net: str) -> None:
+        # Ensure the egress bridge exists.
+        if not self.network_exists(INTERNET_NET):
+            run([self.cli, "network", "create", INTERNET_NET])
+        self._ensure_proxy_image()
+        target_digest = self.image_digest(PROXY_IMAGE)
+        target_range = f"{PORT_ALLOC_START}-{PORT_ALLOC_END}"
+        target_ports = f"{PROXY_PORT}:{PROXY_DASH_PORT}"
+        state = self.container_state(PROXY_CONTAINER)
+        if state != "absent":
+            data = self.inspect("container", PROXY_CONTAINER) or {}
+            labels = (data.get("Config") or {}).get("Labels") or {}
+            current_digest = labels.get("bach.proxy.image_digest", "")
+            current_range = labels.get("bach.proxy.port_range", "")
+            current_ports = labels.get("bach.proxy.ports", "")
+            if current_digest != target_digest:
+                print(f"bach: recreating {PROXY_CONTAINER} (image changed)")
+                run([self.cli, "rm", "-f", PROXY_CONTAINER], check=False)
+                state = "absent"
+            elif current_range != target_range:
+                print(f"bach: recreating {PROXY_CONTAINER} (port range {current_range or '<unset>'} -> {target_range})")
+                run([self.cli, "rm", "-f", PROXY_CONTAINER], check=False)
+                state = "absent"
+            elif current_ports != target_ports:
+                print(f"bach: recreating {PROXY_CONTAINER} (proxy/dash ports {current_ports or '<unset>'} -> {target_ports})")
+                run([self.cli, "rm", "-f", PROXY_CONTAINER], check=False)
+                state = "absent"
+        if state == "absent":
+            cidr = self.network_cidr(INTERNET_NET)
+            print(f"bach: starting {PROXY_CONTAINER} (dash_allow_cidr={cidr}, fwd_range={target_range}, ports={target_ports})")
+            run([
+                self.cli, "run", "-d",
+                "--name", PROXY_CONTAINER,
+                "--restart", "unless-stopped",
+                "--network", INTERNET_NET,
+                "--label", f"bach.proxy.image_digest={target_digest}",
+                "--label", f"bach.proxy.port_range={target_range}",
+                "--label", f"bach.proxy.ports={target_ports}",
+                "-p", f"127.0.0.1:{PROXY_DASH_PORT}:{PROXY_DASH_PORT}",
+                "-p", f"127.0.0.1:{PORT_ALLOC_START}-{PORT_ALLOC_END}:{PORT_ALLOC_START}-{PORT_ALLOC_END}",
+                "-e", f"BACH_PROXY_LISTEN=:{PROXY_PORT}",
+                "-e", f"BACH_DASH_LISTEN=:{PROXY_DASH_PORT}",
+                "-e", f"BACH_DASH_ALLOW_CIDR={cidr}",
+                "-e", f"BACH_FORWARD_RANGE={target_range}",
+                PROXY_IMAGE,
+            ])
+        elif state == "stopped":
+            run([self.cli, "start", PROXY_CONTAINER])
+        # Idempotently join the project network.
+        if not self._proxy_on_net(net):
+            run([self.cli, "network", "connect", net, PROXY_CONTAINER])
+
+    def _ensure_proxy_image(self) -> None:
+        if self.image_inspect(PROXY_IMAGE):
+            return
+        proxy_dir = BACH_REPO / "proxy"
+        print(f"bach: building {PROXY_IMAGE} from {proxy_dir}")
+        self.image_build(PROXY_IMAGE, proxy_dir)
+
+    def network_cidr(self, net: str) -> str:
+        data = self.inspect("network", net)
+        if not data:
+            raise RuntimeError(f"network {net} missing")
+        ipam = (data.get("IPAM") or {}).get("Config") or []
+        for entry in ipam:
+            subnet = entry.get("Subnet")
+            if subnet:
+                return subnet
+        raise RuntimeError(f"no subnet for network {net}")
+
+    def stop_proxy(self) -> None:
+        if self.container_state(PROXY_CONTAINER) == "running":
+            run([self.cli, "stop", PROXY_CONTAINER], check=False)
+
+    def proxy_status(self) -> str:
+        state = self.container_state(PROXY_CONTAINER)
+        if state == "running":
+            return f"{state} ({PROXY_CONTAINER})  dashboard http://127.0.0.1:{PROXY_DASH_PORT}/"
+        return f"{state} ({PROXY_CONTAINER})"
+
+    def proxy_log_cmd(self) -> list[str] | None:
+        if self.container_state(PROXY_CONTAINER) == "absent":
+            return None
+        return [self.cli, "logs", "--tail", "50", PROXY_CONTAINER]
+
+    def _proxy_on_net(self, net: str) -> bool:
+        data = self.inspect("container", PROXY_CONTAINER)
+        if not data:
+            return False
+        return net in ((data.get("NetworkSettings") or {}).get("Networks") or {})
+
+    def list_running_sessions(self, project_id: str) -> list[str]:
+        res = subprocess.run(
+            [self.cli, "ps",
+             "--filter", f"label=bach.project={project_id}",
+             "--filter", "label=bach.role=session",
+             "--filter", "status=running",
+             "--format", "{{.Names}}"],
+            capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            return []
+        return [n for n in res.stdout.splitlines() if n]
+
+    def list_all_running_sessions(self) -> list[str]:
+        res = subprocess.run(
+            [self.cli, "ps",
+             "--filter", "label=bach.role=session",
+             "--filter", "status=running",
+             "--format", "{{.Names}}"],
+            capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            return []
+        return [n for n in res.stdout.splitlines() if n]
+
+
+# Per-process registry-auth cache, partitioned by backend so a session that
+# (somehow) used both wouldn't cross-trust.
+_apple_authed: set[str] = set()
+_docker_authed: set[str] = set()
+
+
+def select_backend(cfg: dict) -> Backend:
+    """Pick the backend. `.bach.toml` may set `backend = "docker"` or
+    `"apple"`. Default: docker."""
+    name = (cfg.get("backend") or "docker").lower()
+    if name == "apple":
+        return AppleBackend()
+    if name == "docker":
+        return DockerBackend()
+    raise RuntimeError(f"unknown backend: {name!r} (expected 'docker' or 'apple')")
+
+
+# ---------- per-project image ----------
+
+def ensure_project_image(cfg: dict, backend: Backend) -> str:
+    """Return the image to use for the session.
+
+    If apt_packages or [[install]] is set, build a project-specific image
+    extending the configured base (default bach:base). Tag derived from the
+    sorted package list + install scripts so unchanged configs reuse builds.
+
+    [[install]] runs arbitrary shell during the image build. Each entry needs
+    `script`; optional `name` is purely for the Dockerfile comment + log line.
+    Build network is the host's, not the bach proxy, so curl/wget to anywhere
+    works during install."""
+    base = cfg.get("image", DEFAULT_IMAGE)
+    backend.ensure_registry_auth(base)
+    pkgs = sorted(set(cfg.get("apt_packages", []) or []))
+    installs = cfg.get("install", []) or []
+    if not pkgs and not installs:
+        return base
+
+    base_digest = backend.image_digest(base)
+    hash_parts = [backend.name, base, base_digest, *pkgs]
+    for i in installs:
+        hash_parts.append(json.dumps(i, sort_keys=True))
+    digest = hashlib.sha256(("|".join(hash_parts)).encode()).hexdigest()[:12]
+    tag = f"bach-proj:{digest}"
+
+    if backend.image_inspect(tag) is not None:
+        return tag
+
+    summary = []
+    if pkgs:
+        summary.append(f"apt: {' '.join(pkgs)}")
+    if installs:
+        summary.append(f"install: {' '.join(i.get('name', '?') for i in installs)}")
+    print(f"bach: building project image ({'; '.join(summary)})")
+    build_dir = BACH_STATE / "build" / digest
+    build_dir.mkdir(parents=True, exist_ok=True)
+    parts = [f"FROM {base}", "ENV DEBIAN_FRONTEND=noninteractive"]
+    if pkgs:
+        parts.append(
+            "RUN apt-get update && apt-get install -y --no-install-recommends \\\n"
+            f"        {' '.join(pkgs)} \\\n"
+            "    && rm -rf /var/lib/apt/lists/*"
+        )
+    # Each [[install]] becomes a COPY-then-RUN of a script file. Avoids
+    # BuildKit-heredoc dependency, keeps multi-line scripts readable, and
+    # surfaces script-level syntax errors with line numbers.
+    for i, inst in enumerate(installs):
+        script_path = build_dir / f"install-{i}.sh"
+        script_path.write_text("#!/bin/sh\nset -eu\n" + inst["script"].strip() + "\n")
+        os.chmod(script_path, 0o755)
+        name = inst.get("name", f"step-{i}")
+        parts.append(f"# install: {name}")
+        parts.append(f"COPY install-{i}.sh /tmp/install-{i}.sh")
+        parts.append(f"RUN /tmp/install-{i}.sh && rm /tmp/install-{i}.sh")
+    (build_dir / "Dockerfile").write_text("\n".join(parts) + "\n")
+    backend.image_build(tag, build_dir)
+    return tag
+
+# ---------- credentials ----------
+
+def stage_credentials() -> pathlib.Path:
+    """Extract Claude Code credentials from macOS keychain into staging dir.
+    Returns the staging dir (to bind-mount into the container)."""
+    runtime = BACH_STATE / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    runtime.chmod(0o700)
+    cred_path = runtime / ".credentials.json"
+    res = subprocess.run(
+        ["security", "find-generic-password",
+         "-s", KEYCHAIN_SERVICE, "-a", os.environ.get("USER", ""), "-w"],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"could not read '{KEYCHAIN_SERVICE}' from keychain. "
+            "Log in with claude on the host first."
+        )
+    cred_path.write_text(res.stdout.strip() + "\n")
+    cred_path.chmod(0o600)
+    return runtime
+
+# Appended to the staged CLAUDE.md so the agent knows it's in bach and how to
+# get a host approved through the proxy dashboard. Kept here so the boilerplate
+# travels with the wrapper rather than being baked into the image.
+BACH_CLAUDE_MD_SUFFIX = """\
+
+# Operating environment
+
+You are running inside `bach`, a sandboxed Debian Linux container on the user's macOS host. The project source is
+at `/work` (this is your CWD). You are the unprivileged `agent` user; you have NO sudo and cannot install
+system packages. Use `mise` for language toolchains.
+
+## Network
+
+There is no direct internet egress from this container. All outbound HTTP/HTTPS traffic is routed through
+`bach-proxy`, which enforces a per-project hostname allowlist. If a host is not on the allowlist, the proxy
+holds the request for ~5 seconds awaiting manual approval, then returns 403. A denylist also exists for hosts
+that are rejected immediately.
+
+If you genuinely need a site that is not allowed:
+
+1. Just try the request — if it works, the host is already allowed.
+2. If you get a 403 (or the request stalls and then fails), tell the user the exact hostname and ask them to
+   approve it at the proxy dashboard: http://127.0.0.1:8081/ on their host.
+3. Once they confirm they've approved it, retry the request. Approvals last 10 minutes by default.
+
+Do not try to work around the proxy or use alternate hosts to bypass it; that defeats the sandbox.
+
+## Access
+
+The user reaches this container only via the terminal you are running in. They cannot open a browser inside
+the container or reach a server you start on a container-local port. If you need to expose a web server, it
+must be declared as a `[[ports]]` entry in `.bach.toml` so bach-proxy forwards it to a published host port;
+otherwise the user has no way to see it.
+
+## Clipboard
+
+`pbcopy` is available and writes to the user's macOS clipboard via OSC 52 (e.g. `echo foo | pbcopy`).
+"""
+
+
+def stage_claude_md(runtime_dir: pathlib.Path) -> None:
+    """Stage a CLAUDE.md for the container: copy the host's `~/.claude/CLAUDE.md`
+    if present, then append a sandbox-aware suffix telling the agent it's in
+    bach and how to request a proxy approval. Always staged (even when the host
+    file is missing) so the suffix is present in every session."""
+    host_md = pathlib.Path(os.path.expanduser("~/.claude/CLAUDE.md"))
+    body = ""
+    if host_md.is_file():
+        try:
+            body = host_md.read_text()
+        except OSError as e:
+            print(f"bach: warning: could not read {host_md}: {e}", file=sys.stderr)
+    if body and not body.endswith("\n"):
+        body += "\n"
+    out = body + BACH_CLAUDE_MD_SUFFIX
+    target = runtime_dir / "CLAUDE.md"
+    target.write_text(out)
+    target.chmod(0o644)
+
+def cache_slug(p: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", p.lower()).strip("-") or "cache"
+
+def setup_caches(cfg: dict, root: pathlib.Path, runtime_dir: pathlib.Path) -> list[str]:
+    """Translate [[cache]] entries into docker-run flags. Modes:
+      - rw: plain bind-mount of host cache dir at /work/<path>.
+      - ro: bind-mount read-only.
+      - overlay: bind host cache at /bach-cache/<slug> RW (host base). The
+        entrypoint rsyncs base -> /work/<path> at start (warm) and pushes
+        /work/<path> -> base on clean exit (promote, last-writer-wins).
+        Each session has its own writable copy in /work, so concurrent
+        sessions can't corrupt each other mid-build."""
+    (runtime_dir / "cache-manifest").unlink(missing_ok=True)
+    entries = cfg.get("cache", []) or []
+    if not entries:
+        return []
+    flags: list[str] = []
+    manifest: list[str] = []
+    for c in entries:
+        path = c["path"].strip("/")
+        mode = c.get("mode", "overlay")
+        if mode not in ("rw", "ro", "overlay"):
+            raise RuntimeError(f"bach: unknown cache mode {mode!r} for {path!r}")
+        slug = cache_slug(path)
+        host_dir = BACH_DATA / "cache" / "projects" / root.name / slug
+        host_dir.mkdir(parents=True, exist_ok=True)
+        target = f"/work/{path}"
+        if mode == "ro":
+            flags += ["--mount", f"type=bind,source={host_dir},target={target},readonly"]
+        elif mode == "rw":
+            flags += ["--mount", f"type=bind,source={host_dir},target={target}"]
+        else:
+            flags += ["--mount", f"type=bind,source={host_dir},target=/bach-cache/{slug}"]
+            manifest.append(f"{slug}\t{target}")
+    if manifest:
+        (runtime_dir / "cache-manifest").write_text("\n".join(manifest) + "\n")
+    return flags
+
+def stage_files(cfg: dict) -> None:
+    """Copy host files declared in [[stage]] into runtime/stage/, with a
+    manifest the entrypoint reads to place each one inside the container.
+
+    If `from` ends with `/`, the source is a directory and is copied
+    recursively with symlinks dereferenced — useful for trees like
+    ~/.claude/skills/ that contain symlinks pointing elsewhere on the host."""
+    stage_dir = BACH_STATE / "runtime" / "stage"
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir)
+    entries = cfg.get("stage", [])
+    if not entries:
+        return
+    stage_dir.mkdir(parents=True)
+    manifest_lines = []
+    for i, entry in enumerate(entries):
+        raw_from = entry["from"]
+        src = pathlib.Path(os.path.expanduser(raw_from))
+        if not src.exists():
+            print(f"bach: warning: stage source missing: {src}", file=sys.stderr)
+            continue
+        sname = f"f{i}"
+        mode = entry.get("mode", "0644")
+        if raw_from.endswith("/"):
+            if not src.is_dir():
+                print(f"bach: warning: stage source has trailing / but is not a directory: {src}", file=sys.stderr)
+                continue
+            # symlinks=False → follow symlinks, copying their resolved contents.
+            shutil.copytree(src, stage_dir / sname, symlinks=False, ignore_dangling_symlinks=True)
+            manifest_lines.append(f"{sname}\t{entry['to']}\t{mode}\td")
+        else:
+            shutil.copyfile(src, stage_dir / sname)
+            (stage_dir / sname).chmod(0o600)
+            # No kind column for files: preserves the old 3-column format so an
+            # older baked-in entrypoint still parses file entries correctly.
+            manifest_lines.append(f"{sname}\t{entry['to']}\t{mode}")
+    (stage_dir / "manifest").write_text(
+        ("\n".join(manifest_lines) + "\n") if manifest_lines else ""
+    )
+
+# ---------- services ----------
+
+def ensure_services(root: pathlib.Path, cfg: dict, net: str, backend: Backend) -> None:
+    services = cfg.get("services", {})
+    for svc, spec in services.items():
+        name = cn(root, svc)
+        state = backend.container_state(name)
+        if state == "running":
+            continue
+        if state == "stopped":
+            # A stopped service is most often one that failed on first start.
+            # Recreating is closer to user intent than reusing stale env. To
+            # preserve a service across sessions, leave it running (bach
+            # doesn't stop services unless asked).
+            print(f"bach: recreating {svc} (was stopped)")
+            run([backend.cli, "rm", "-f", name], check=False)
+            state = "absent"
+        backend.ensure_registry_auth(spec["image"])
+        print(f"bach: creating {svc} ({spec['image']})")
+        # Service container name on the project network; Docker sets the
+        # network alias to the container name so siblings resolve `svc` via
+        # the alias below.
+        cmd = [backend.cli, "run", "-d", "--name", name,
+               "--network", net,
+               "--network-alias", svc]
+        for k, v in (spec.get("env") or {}).items():
+            cmd += ["-e", f"{k}={v}"]
+        owner = spec.get("volume_init_owner")
+        for vspec in spec.get("volumes", []):
+            vol, mount = vspec.split(":", 1)
+            vname = vol_name(root, vol)
+            backend.ensure_volume(vname)
+            if owner:
+                backend.chown_volume(vname, owner)
+            cmd += ["--mount", f"type=volume,source={vname},target={mount}"]
+        if "platform" in spec:
+            cmd += ["--platform", spec["platform"]]
+        cmd += [spec["image"]]
+        command = spec.get("command")
+        if isinstance(command, str):
+            cmd += command.split()
+        elif isinstance(command, list):
+            cmd += command
+        run(cmd)
+    # wait briefly for services to obtain IPs
+    if services:
+        time.sleep(1.0)
+
+def stop_services(root: pathlib.Path, cfg: dict, backend: Backend) -> None:
+    for svc in cfg.get("services", {}):
+        name = cn(root, svc)
+        if backend.container_state(name) == "running":
+            print(f"bach: stopping {svc}")
+            run([backend.cli, "stop", name], check=False)
+
+def build_aliases(cfg: dict) -> str:
+    """Render `[aliases]` from .bach.toml as bash `alias k='v'` lines. Names
+    must match identifier syntax; values are single-quoted with embedded
+    quotes escaped."""
+    aliases = cfg.get("aliases") or {}
+    lines: list[str] = []
+    for k, v in aliases.items():
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+            print(f"bach: skipping invalid alias name {k!r}", file=sys.stderr)
+            continue
+        esc = str(v).replace("'", "'\\''")
+        lines.append(f"alias {k}='{esc}'")
+    return "\n".join(lines)
+
+def services_hosts(root: pathlib.Path, cfg: dict, net: str, backend: Backend) -> str:
+    """Apple-only: build BACH_HOSTS string for /etc/hosts injection."""
+    if not backend.injects_hosts():
+        return ""
+    lines = []
+    for svc in cfg.get("services", {}):
+        ip = backend.container_ip(cn(root, svc), net)
+        if ip:
+            lines.append(f"{ip} {svc}")
+        else:
+            print(f"bach: warning: no IP for service {svc}", file=sys.stderr)
+    return "\n".join(lines)
+
+# ---------- session ----------
+
+def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend, *, guard: bool = False) -> None:
+    net = project_id(root)
+
+    # Source mode (.bach.toml `source_mode`, default "auto"):
+    #   auto  — clone if .git exists, else fall back to bind with a warning.
+    #   clone — must clone; error if no .git.
+    #   bind  — always RW bind-mount the project root at /work.
+    # Clone mode mounts .git RO at /host-git; entrypoint clones into /work
+    # (container-ephemeral) and retargets origin to the host's remote URL so
+    # pushes go to GitHub via the proxy.
+    mode = cfg.get("source_mode", "auto")
+    if mode not in ("auto", "clone", "bind"):
+        sys.exit(f"bach: invalid source_mode {mode!r} (want auto|clone|bind)")
+    git_dir = root / ".git"
+    has_git = git_dir.is_dir()
+    if mode == "clone" and not has_git:
+        sys.exit(f"bach: source_mode=clone but no .git in {root}")
+    use_clone = mode != "bind" and has_git
+    if mode == "auto" and not has_git:
+        print(f"bach: no .git in {root.name}, using bind mode", file=sys.stderr)
+
+    session_name = cn(root, f"session-{secrets.token_hex(4)}")
+    mode_label = "clone" if use_clone else "bind"
+    print(f"bach: project {root.name}  [backend={backend.name}, src={mode_label}]")
+    print(f"bach: session {session_name}")
+
+    backend.ensure_network(net)
+    backend.ensure_proxy(net)
+    ensure_services(root, cfg, net, backend)
+
+    # Allocate host ports for this session's [[ports]] entries. The set of
+    # live sessions is "all currently running bach session containers" plus
+    # the one we're about to start (we reserve our allocations before docker
+    # run, then rely on reap-on-invocation to clean up if we crash before
+    # the cleanup handler fires).
+    requested_ports = parse_ports(cfg)
+    live_sessions = set(backend.list_all_running_sessions())
+    live_sessions.add(session_name)
+    allocations = allocate_ports(root.name, session_name, requested_ports, live_sessions)
+    for a in allocations:
+        print(f"bach: port '{a['name']}' -> {a['scheme']}://localhost:{a['host_port']}/ -> :{a['container_port']}")
+
+    register_project_with_proxy(
+        root, cfg, backend, net,
+        ports=project_port_map(_load_ports_state().get("allocations", []), root.name),
+    )
+
+    image = ensure_project_image(cfg, backend)
+    hosts = services_hosts(root, cfg, net, backend)
+    services = list(cfg.get("services", {}).keys())
+    proxy = backend.proxy_host(net)
+    no_proxy = ",".join(["localhost", "127.0.0.1", proxy, *services])
+
+    tty_flag = ["-it"] if sys.stdin.isatty() else ["-i"]
+    cmd = [
+        backend.cli, "run", "--rm", *tty_flag,
+        "--name", session_name,
+        "--hostname", session_name,
+        "--label", f"bach.project={net}",
+        "--label", "bach.role=session",
+        "--network", net,
+        "-w", "/work",
+        "-e", f"HTTP_PROXY=http://{proxy}:{PROXY_PORT}",
+        "-e", f"HTTPS_PROXY=http://{proxy}:{PROXY_PORT}",
+        "-e", f"http_proxy=http://{proxy}:{PROXY_PORT}",
+        "-e", f"https_proxy=http://{proxy}:{PROXY_PORT}",
+        "-e", f"NO_PROXY={no_proxy}",
+        "-e", f"no_proxy={no_proxy}",
+        "-e", f"BACH_HOSTS={hosts}",
+    ]
+
+    if use_clone:
+        origin = to_https_remote(subprocess.run(
+            ["git", "-C", str(root), "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True,
+        ).stdout.strip())
+        cmd += [
+            "--mount", f"type=bind,source={git_dir},target=/host-git,readonly",
+            "-e", "BACH_CLONE_SRC=/host-git",
+            "-e", f"BACH_CLONE_ORIGIN={origin}",
+        ]
+    else:
+        cmd += ["--mount", f"type=bind,source={root},target=/work"]
+
+    # LANG/LC_ALL are intentionally NOT propagated from the host: the container
+    # only generates en_US.UTF-8 (set via ENV in the Dockerfile) and propagating
+    # e.g. en_NZ.UTF-8 from the host lands on an ungenerated locale, which
+    # makes glibc warn and tools like Elixir's BEAM fall back to latin1.
+    for var in ("TERM", "COLORTERM"):
+        if var in os.environ:
+            cmd += ["-e", f"{var}={os.environ[var]}"]
+
+    alias_block = build_aliases(cfg)
+    if alias_block:
+        cmd += ["-e", f"BACH_ALIASES={alias_block}"]
+
+    # Propagate host gh auth into the session. With this set, the system-wide
+    # git credential helper baked into bach:base (`!gh auth git-credential`)
+    # transparently uses the same token for `git push` to github.com.
+    gh_token = host_gh_token()
+    if gh_token:
+        cmd += ["-e", f"GH_TOKEN={gh_token}"]
+
+    git_name, git_email = host_git_identity(root)
+    if git_name:
+        cmd += ["-e", f"BACH_GIT_NAME={git_name}"]
+    if git_email:
+        cmd += ["-e", f"BACH_GIT_EMAIL={git_email}"]
+
+    if cfg.get("mise_cache", True):
+        MISE_CACHE_HOST.mkdir(parents=True, exist_ok=True)
+        cmd += ["--mount", f"type=bind,source={MISE_CACHE_HOST},target=/home/agent/.local/share/mise"]
+
+    runtime_dir = stage_credentials()
+    stage_claude_md(runtime_dir)
+    stage_files(cfg)
+    cmd += setup_caches(cfg, root, runtime_dir)
+    cmd += ["--mount", f"type=bind,source={runtime_dir},target=/bach-runtime,readonly"]
+
+    proj_history = PROJECTS_HOST / root.name
+    proj_history.mkdir(parents=True, exist_ok=True)
+    cmd += ["--mount", f"type=bind,source={proj_history},target=/home/agent/.claude/projects"]
+
+    # NB: we deliberately do not pass `-p` for these allocations. Session
+    # containers live on --internal networks, where Docker silently no-ops
+    # port publishing. Host->container traffic enters via the dual-homed
+    # bach-proxy, which TCP-forwards from its own published range to the
+    # session container's IP on the project network.
+
+    # Top-level session volumes. String syntax: "name:/container/path",
+    # matching service `volumes`. Persisted Docker/Apple-container named
+    # volumes, shared across every session that references the same name
+    # (namespaced `bach-shared-<name>`). Created lazily; chowned to agent
+    # only on first creation so subsequent sessions don't pay an alpine
+    # startup. Use these instead of writable [[mounts]] under /home/agent
+    # — they sidestep VirtioFS uid preservation entirely.
+    for vspec in cfg.get("volumes", []) or []:
+        vol, mount = vspec.split(":", 1)
+        vname = f"bach-shared-{vol}"
+        existed = backend.inspect("volume", vname) is not None
+        backend.ensure_volume(vname)
+        if not existed:
+            backend.chown_volume(vname, "1000:1000")
+        cmd += ["--mount", f"type=volume,source={vname},target={mount}"]
+
+    chown_targets: list[str] = []
+    for mount in cfg.get("mounts", []):
+        src = os.path.expanduser(mount["source"])
+        if not os.path.isabs(src):
+            src = str((root / src).resolve())
+        target = mount["target"]
+        readonly = ",readonly" if mount.get("readonly") else ""
+        cmd += ["--mount", f"type=bind,source={src},target={target}{readonly}"]
+        # VirtioFS preserves host uid on bind mounts, so writable host dirs
+        # appear non-agent-owned inside the container. Opt-in `chown = true`
+        # has the entrypoint chown the target (non-recursive — that's enough
+        # to let agent create files inside, and subsequent files inherit
+        # agent ownership). Ignored on readonly mounts.
+        if mount.get("chown") and not mount.get("readonly"):
+            chown_targets.append(target)
+    if chown_targets:
+        cmd += ["-e", "BACH_CHOWN=" + "\n".join(chown_targets)]
+
+    for k, v in (cfg.get("env") or {}).items():
+        cmd += ["-e", f"{k}={v}"]
+
+    if guard:
+        cmd += ["-e", "BACH_GUARD=1"]
+
+    cmd += [image, *command]
+    run_container_with_cleanup(cmd, root, cfg, backend, net, session_name)
+
+
+def run_container_with_cleanup(
+    cmd: list[str],
+    root: pathlib.Path,
+    cfg: dict,
+    backend: Backend,
+    net: str,
+    session_name: str,
+) -> None:
+    """Launch the session container as a subprocess so we can clean up our
+    port allocations on exit (no execvp — that would replace the Python
+    process and skip cleanup). Signals are forwarded to docker so it can
+    drain the container; we wait for it to finish and then release ports.
+    """
+    short = session_name.rsplit("-", 1)[-1]
+    title_state = set_window_title(f"{root.name}/{short}")
+
+    proc = subprocess.Popen(cmd)
+
+    def _post_forwards_when_ready() -> None:
+        # Poll for the session's container IP, then push the project's
+        # forwards to the proxy so it knows where to TCP-forward each
+        # published host port. Best-effort; warns on timeout.
+        deadline = time.monotonic() + 15.0
+        ip = None
+        while time.monotonic() < deadline:
+            ip = backend.container_ip(session_name, net)
+            if ip:
+                break
+            time.sleep(0.2)
+        if not ip:
+            print(f"bach: warning: could not resolve {session_name} IP for forwards", file=sys.stderr)
+            return
+        allocs = _load_ports_state().get("allocations", [])
+        forwards = build_forwards(allocs, root.name, lambda s: ip if s == session_name else backend.container_ip(s, net))
+        post_forwards_to_proxy(root.name, forwards)
+
+    threading.Thread(target=_post_forwards_when_ready, daemon=True).start()
+
+    # SIGINT (Ctrl-C) goes to the whole foreground process group, so docker
+    # already receives it directly — don't double-forward. SIGTERM/SIGHUP
+    # arrive only at this Python process, so explicitly relay them to docker
+    # to give the container a chance to drain.
+    def _forward(sig: int, _frame) -> None:
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
+
+    prev_handlers: dict[int, object] = {}
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            prev_handlers[s] = signal.signal(s, _forward)
+        except (OSError, ValueError):
+            pass
+
+    try:
+        while True:
+            try:
+                rc = proc.wait()
+                break
+            except KeyboardInterrupt:
+                # Docker handles its own SIGINT (forwards to container). Keep
+                # waiting for it to finish.
+                continue
+    finally:
+        for s, h in prev_handlers.items():
+            try:
+                signal.signal(s, h)  # type: ignore[arg-type]
+            except (OSError, ValueError, TypeError):
+                pass
+        remaining = release_session_ports(session_name)
+        try:
+            register_project_with_proxy(
+                root, cfg, backend, net,
+                ports=project_port_map(remaining, root.name),
+            )
+            forwards = build_forwards(remaining, root.name, lambda s: backend.container_ip(s, net))
+            post_forwards_to_proxy(root.name, forwards)
+        except Exception:
+            pass
+        restore_window_title(title_state)
+
+    sys.exit(rc)
+
+# ---------- subcommands ----------
+
+def cmd_status(backend: Backend) -> None:
+    root, cfg = find_project()
+    print(f"project: {root.name}  ({root})")
+    print(f"backend: {backend.name}")
+    print(f"network: {project_id(root)}")
+    print(f"proxy:   {backend.proxy_status()}")
+    print()
+    services = cfg.get("services", {})
+    if services:
+        print("services:")
+        for svc in services:
+            name = cn(root, svc)
+            state = backend.container_state(name)
+            ip = backend.container_ip(name) if state == "running" else None
+            print(f"  {svc:<16} {state:<10} {ip or ''}")
+    else:
+        print("services: (none configured)")
+
+def cmd_log(backend: Backend) -> None:
+    log_cmd = backend.proxy_log_cmd()
+    if log_cmd is None:
+        print("(no proxy log yet)")
+        return
+    subprocess.run(log_cmd)
+
+def cmd_build(backend: Backend) -> None:
+    print(f"bach: building {DEFAULT_IMAGE} from {BACH_REPO}")
+    backend.image_build(DEFAULT_IMAGE, BACH_REPO)
+
+def cmd_ps(backend: Backend) -> None:
+    root, _ = find_project()
+    names = backend.list_running_sessions(project_id(root))
+    if not names:
+        print("(no running sessions)")
+        return
+    for n in names:
+        print(n)
+
+def pick_session(backend: Backend, root: pathlib.Path, target: str | None) -> str:
+    names = backend.list_running_sessions(project_id(root))
+    if target:
+        if target not in names:
+            print(f"bach: no running session named {target!r}", file=sys.stderr)
+            print("running sessions:", file=sys.stderr)
+            for n in names:
+                print(f"  {n}", file=sys.stderr)
+            sys.exit(1)
+        return target
+    if not names:
+        print("bach: no running sessions for this project", file=sys.stderr)
+        sys.exit(1)
+    if len(names) > 1:
+        if not sys.stdin.isatty():
+            print("bach: multiple running sessions; pick one with --to <name> or $BACH_SESSION:", file=sys.stderr)
+            for n in names:
+                print(f"  {n}", file=sys.stderr)
+            sys.exit(1)
+        print("multiple running sessions:", file=sys.stderr)
+        for i, n in enumerate(names, 1):
+            print(f"  {i}) {n}", file=sys.stderr)
+        while True:
+            try:
+                raw = input(f"pick [1-{len(names)}]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(file=sys.stderr)
+                sys.exit(1)
+            if raw.isdigit() and 1 <= int(raw) <= len(names):
+                return names[int(raw) - 1]
+            print("invalid", file=sys.stderr)
+    return names[0]
+
+def cmd_exec(backend: Backend, args: list[str]) -> None:
+    target = os.environ.get("BACH_SESSION")
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--to", "-t"):
+            if i + 1 >= len(args):
+                print("bach: --to needs a session name", file=sys.stderr)
+                sys.exit(2)
+            target = args[i + 1]
+            i += 2
+            continue
+        rest = args[i:]
+        break
+    root, _ = find_project()
+    name = pick_session(backend, root, target)
+    cmd = rest or ["bash", "-l"]
+    tty_flag = ["-it"] if sys.stdin.isatty() else ["-i"]
+    full = [backend.cli, "exec", *tty_flag, "-u", "agent", "-w", "/work", name, *cmd]
+
+    # Set the terminal/tmux window title for the duration of the exec.
+    # Can't use execvp here because we need to regain control to restore.
+    short = name.rsplit("-", 1)[-1]
+    title_state = set_window_title(f"{root.name}/{short}")
+    try:
+        rc = subprocess.call(full)
+    finally:
+        restore_window_title(title_state)
+    sys.exit(rc)
+
+HELP_TEXT = """\
+bach — sandboxed Claude Code in a container
+
+  Spawns a Linux container with the current project bind-mounted (or cloned)
+  at /work, no direct internet egress (HTTPS via the bach-proxy allowlist
+  enforcer; dashboard at http://127.0.0.1:8081/), and any backend services
+  from .bach.toml on a project-local network.
+
+USAGE
+  bach [global-flags] [subcommand] [args...]
+
+SUBCOMMANDS
+  (no args)               Start an interactive shell in a new session.
+  shell, s                Same as no args.
+  claude, c [args...]     Start Claude. With no args, runs under bash so
+                          Ctrl-Z suspends Claude to a shell (fg resumes).
+                          With args, runs `claude <args>` directly.
+  run <cmd>...            Run a one-off command in a fresh session, no TTY
+                          wrapping. Exits when the command exits.
+
+  exec [--to <name>] [cmd...]
+                          Exec into an already-running session as `agent` in
+                          /work. Default cmd: `bash -l`. With multiple
+                          sessions and a TTY you get a picker; otherwise
+                          target one with --to <name> or $BACH_SESSION.
+  e                       Alias for exec.
+  ps                      List this project's running session containers.
+
+  up                      Start the proxy + backend services from .bach.toml.
+  down                    Stop the project's backend services.
+  status                  Show project, backend, proxy, and service state.
+  log                     Tail the bach-proxy log.
+  build                   Rebuild the bach:base image from this repo's
+                          Dockerfile. Per-project images auto-invalidate on
+                          next session.
+  help                    Show this help.
+
+GLOBAL FLAGS
+  -h, --help              Show this help.
+
+CONFIG (.bach.toml)
+  Walked up from cwd. The directory containing it is the project root.
+
+    backend = "docker"               # or "apple"
+    source_mode = "auto"             # auto (default) | clone | bind.
+                                     #   auto  — clone if .git, else bind.
+                                     #   clone — must clone (error if no .git).
+                                     #   bind  — RW bind-mount project root.
+    mise_cache = true                # share host mise tool cache
+    apt_packages = ["build-essential"]  # extra apt packages → per-project image
+    image = "bach:base"              # override the base image
+
+    [[ports]]                        # forwarded ports; host port auto-assigned
+    name = "web"                     # from 4100 upwards. Sticky per (project,name).
+    container = 4000                 # Optional: host = N (pin), scheme = "https".
+
+    [aliases]                        # bash aliases inside the container
+    c  = "claude"
+    ll = "ls -la"
+
+    [[stage]]                        # copy a host file into the container
+    from = "~/.config/mise/age.txt"
+    to   = "/home/agent/.config/mise/age.txt"
+    mode = "0600"
+
+    [[stage]]                        # trailing / on `from` stages a whole dir
+    from = "~/.claude/skills/"       # symlinks are dereferenced
+    to   = "/home/agent/.claude/skills"
+
+    [services.postgres]              # service container on the project net
+    image = "postgres:16-alpine"
+    env    = { POSTGRES_USER = "postgres" }
+    volumes = ["postgres-data:/var/lib/postgresql/data"]
+
+ENVIRONMENT
+  BACH_SESSION             Default target for `bach exec` when multiple
+                           sessions are running.
+
+EXAMPLES
+  bach                     # interactive shell
+  bach c                   # launch claude (Ctrl-Z works)
+  bach c --resume          # `claude --resume`
+  bach run pnpm install    # one-off command
+  bach exec                # attach a shell to a running session
+  bach exec ls /work       # one-off command in a running session
+  bach up && bach status   # start services and inspect
+
+PATHS
+  ~/.local/share/bach/projects/<proj>/   Per-project Claude history.
+  ~/.local/share/bach/cache/mise/        Shared mise tool cache.
+  ~/.local/state/bach/proxy.log          bach-proxy log (apple backend).
+                                         (docker backend: `bach log` tails
+                                         `docker logs bach-proxy`.)
+"""
+
+
+def usage(exit_code: int = 2) -> None:
+    out = sys.stdout if exit_code == 0 else sys.stderr
+    print(HELP_TEXT, file=out, end="")
+    sys.exit(exit_code)
+
+def main() -> None:
+    raw = sys.argv[1:]
+    args: list[str] = []
+    for a in raw:
+        if a in ("-h", "--help"):
+            usage(0)
+        else:
+            args.append(a)
+
+    root, cfg = find_project()
+    backend = select_backend(cfg)
+
+    # Reap port allocations belonging to sessions that are no longer running.
+    # Safety net for the SIGKILL-bach case where the per-session cleanup
+    # handler didn't get to fire. Best-effort: a broken backend just means
+    # the file stays as-is until the next successful invocation.
+    try:
+        reap_ports(set(backend.list_all_running_sessions()))
+    except Exception as e:
+        print(f"bach: warning: port reap failed: {e}", file=sys.stderr)
+
+    if args and args[0] == "up":
+        net = project_id(root)
+        backend.ensure_network(net)
+        backend.ensure_proxy(net)
+        allocs = _load_ports_state().get("allocations", [])
+        register_project_with_proxy(
+            root, cfg, backend, net,
+            ports=project_port_map(allocs, root.name),
+        )
+        forwards = build_forwards(allocs, root.name, lambda s: backend.container_ip(s, net))
+        post_forwards_to_proxy(root.name, forwards)
+        ensure_services(root, cfg, net, backend)
+        print("bach: up")
+    elif args and args[0] == "down":
+        stop_services(root, cfg, backend)
+        print("bach: down")
+    elif args and args[0] == "status":
+        cmd_status(backend)
+    elif args and args[0] == "log":
+        cmd_log(backend)
+    elif args and args[0] == "ps":
+        cmd_ps(backend)
+    elif args and args[0] == "build":
+        cmd_build(backend)
+    elif args and args[0] in ("exec", "e"):
+        cmd_exec(backend, args[1:])
+    elif args and args[0] in ("shell", "s"):
+        session(root, cfg, ["bash", "-l"], backend, guard=True)
+    elif args and args[0] in ("claude", "c"):
+        if len(args) == 1:
+            # Interactive bash that auto-runs claude. Gives proper job control
+            # (Ctrl-Z suspends claude, drops to shell; fg resumes).
+            session(root, cfg, ["bash", "--rcfile", "/etc/bach-rcfile", "-i"], backend, guard=True)
+        else:
+            session(root, cfg, ["claude", *args[1:]], backend)
+    elif args and args[0] == "run":
+        if len(args) < 2:
+            usage()
+        session(root, cfg, args[1:], backend)
+    elif args and args[0] == "help":
+        usage(0)
+    elif args:
+        print(f"bach: unknown subcommand {args[0]!r}", file=sys.stderr)
+        usage(2)
+    else:
+        # Default: shell.
+        session(root, cfg, ["bash", "-l"], backend, guard=True)
+
+if __name__ == "__main__":
+    main()
