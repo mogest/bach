@@ -2,8 +2,7 @@
 
 Sandboxed Claude Code in a Linux container. Per-project network, allowlisted
 HTTP/CONNECT proxy, optional backend services (postgres, redis, …) declared in
-`.bach.toml`. macOS host today; Docker by default with an Apple `container` (microVM)
-backend selectable per-project.
+`.bach.toml`. macOS host today; runs on Docker.
 
 ## Status
 
@@ -13,14 +12,11 @@ not "Claude is actively malicious."
 ## Requirements
 
 - macOS on Apple Silicon
-- Docker (default backend), OR `container` (Apple's CLI; opt-in per project)
+- Docker
 - `gh` CLI logged in (used for: propagating GitHub auth into the sandbox, and `docker login` for `ghcr.io`)
 
 ```sh
 brew install docker gh
-# Optional, for the Apple backend:
-brew install --cask container
-container system start --enable-kernel-install
 ```
 
 ## Install
@@ -32,9 +28,7 @@ docker build -t bach:base .
 ln -s "$PWD/bach" ~/.local/bin/bach
 ```
 
-The `bach-proxy` container image is built lazily on first use. On the Apple
-backend the proxy is a host-side Go binary, built lazily on first use (requires
-`go` installed).
+The `bach-proxy` container image is built lazily on first use.
 
 ## Use
 
@@ -94,7 +88,6 @@ same env var. For `ghcr.io` pulls, the same token is fed to `docker login`
 Walked up from the cwd. The directory containing it is the project root.
 
 ```toml
-backend = "docker"                  # or "apple". Default docker.
 source_mode = "auto"                # auto (default) | clone | bind. See *Source mode*.
 image = "bach:base"                 # override the base image
 mise_cache = true                   # share host mise tool cache (default true)
@@ -208,7 +201,7 @@ Merge rules:
 - Tables merge by key, later wins per key: `env`, `aliases`. `[services.<name>]`
   is replace-by-name (project-level service spec fully replaces user-level one
   with the same name; no deep merge of `env`/`volumes`/...).
-- Scalars last-wins: `backend`, `image`, `mise_cache`.
+- Scalars last-wins: `image`, `mise_cache`.
 
 Example — neovim in every session:
 
@@ -248,14 +241,12 @@ etc.) avoid running updates from two sessions concurrently.
   resolutions that hit private ranges), 5s pending-approval window, 10min
   temp-allow on approval. Dashboard on `127.0.0.1:8081` (host-side only;
   containers can't reach it).
-  - Docker: single dual-homed `bach-proxy` container on a shared `bach-internet`
-    bridge plus every project network; reachable as `bach-proxy:8080` by DNS.
-  - Apple: host-side binary; reachable at the per-project network gateway IP.
+  A single dual-homed `bach-proxy` container sits on a shared `bach-internet`
+  bridge plus every project network; reachable as `bach-proxy:8080` by DNS.
 - **Source**: clone mode (default) or bind mount, set via `source_mode`. See *Source mode*.
 - **Services** (`[services.<name>]`): each becomes a container named
   `bach-<project>-<svc>` on the project network. Reached from the session
-  container by short name (`postgres`, `redis`, …). Docker uses bridge DNS;
-  Apple injects `/etc/hosts` entries.
+  container by short name (`postgres`, `redis`, …) via Docker bridge DNS.
 - **Credentials**: host's Claude Code OAuth token is extracted from the macOS
   keychain into a 0700 staging dir, mounted read-only at `/bach-runtime`; the
   entrypoint copies it into the ephemeral `~/.claude` of the session
@@ -274,8 +265,6 @@ etc.) avoid running updates from two sessions concurrently.
 ~/.local/share/bach/cache/mise/                # shared mise tool cache
 ~/.local/share/bach/cache/projects/<proj>/     # per-project [[cache]] data
 ~/.local/share/bach/projects/<proj>/           # per-project claude history
-~/.local/state/bach/proxy.{log,pid,err}        # host-side proxy state (Apple)
-~/.local/state/bach/proxy-bin/bach-proxy       # host-built proxy binary (Apple)
 ~/.local/state/bach/runtime/                   # 0700 staged secrets + [[stage]]
 ~/.local/state/bach/build/<hash>/Dockerfile    # generated per-project image dirs
 ```
@@ -285,8 +274,8 @@ etc.) avoid running updates from two sessions concurrently.
 ```
 bach              # Python 3 CLI (single file, stdlib only). Symlink to ~/.local/bin/bach.
 Dockerfile        # bach:base. Debian trixie-slim + claude + mise + entrypoint.
-entrypoint.sh     # Runs as root: seeds ~/.claude, applies BACH_HOSTS,
-                  # [[stage]], [[cache]] warm/promote, then runuser to agent.
+entrypoint.sh     # Runs as root: seeds ~/.claude, applies [[stage]],
+                  # [[cache]] warm/promote, then runuser to agent.
 bach-rcfile       # Sourced by `bash --rcfile -i` when `bach c` runs claude
                   # under bash for job control.
 proxy/            # bach-proxy: Go HTTP/CONNECT proxy with allowlist + SSE dashboard.

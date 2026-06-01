@@ -76,13 +76,6 @@ cat > /home/agent/.claude.json <<'EOF'
 EOF
 chown agent:agent /home/agent/.claude.json
 
-# BACH_HOSTS: newline-separated "ip name" lines, written by the wrapper after
-# resolving backend service container IPs. Append to /etc/hosts so apps reach
-# services by short name (postgres, redis, ...).
-if [ -n "${BACH_HOSTS:-}" ]; then
-    printf '%s\n' "$BACH_HOSTS" >> /etc/hosts
-fi
-
 # BACH_CHOWN: newline-separated container paths to chown to agent. Bach adds
 # writable [[mounts]] targets that opt in with `chown = true`. Non-recursive
 # is intentional: VirtioFS preserves the host uid for bind-mounted dirs, so

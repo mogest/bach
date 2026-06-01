@@ -1,14 +1,14 @@
 # bach
 
-Sandboxed Claude Code in a Linux container. Pluggable backend (Docker, default; Apple `container` CLI as a microVM option) + bach-proxy (Go, allowlisted HTTP/CONNECT proxy with SSE dashboard) + a Debian image. Per-project network, per-project optional image, bind-mounted source.
+Sandboxed Claude Code in a Linux container. Docker backend (behind a `Backend` abstraction so another backend could be added as a subclass) + bach-proxy (Go, allowlisted HTTP/CONNECT proxy with SSE dashboard) + a Debian image. Per-project network, per-project optional image, bind-mounted source.
 
 ## What bach does
 
 `bach` from a project dir spawns a session container (default: interactive shell; `bach c` for claude). The container:
 
 - Has the project source available at `/work`. Controlled by `source_mode` in `.bach.toml` — `auto` (default) clones when `.git` is present and falls back to bind otherwise; `clone` is strict (error if no `.git`); `bind` always RW-binds the project root. **Clone mode**: host's `.git` mounted read-only at `/host-git`, entrypoint inits a worktree under `/work` backed by git alternates → near-instant, near-zero extra disk, new commits ephemeral with the session unless pushed.
-- Has zero direct internet egress — the project network is `--internal`. Outbound HTTP/HTTPS goes through bach-proxy. One proxy serves the whole system; on Docker that's a dual-homed proxy container reachable as `bach-proxy:8080`, on Apple it's a host-side `bach-proxy` binary reachable at each project network's gateway. **Per-project hostname allowlist** (from `.bach.toml` `allowlist = [...]`), DNS-rebinding protection (refuses RFC1918 resolutions), 5s pending-approval window, 10min temp-allow on approval, dashboard at `http://127.0.0.1:8081/`. Default-deny: no global allowlist — projects without a configured allowlist hold every request for manual approval.
-- Has backend services (postgres, redis, etc.) from `.bach.toml` running on the same network, reachable from the session container by short name (Docker resolves natively via bridge DNS; Apple injects `/etc/hosts` entries from `BACH_HOSTS`).
+- Has zero direct internet egress — the project network is `--internal`. Outbound HTTP/HTTPS goes through bach-proxy. One proxy serves the whole system: a dual-homed proxy container reachable as `bach-proxy:8080`. **Per-project hostname allowlist** (from `.bach.toml` `allowlist = [...]`), DNS-rebinding protection (refuses RFC1918 resolutions), 5s pending-approval window, 10min temp-allow on approval, dashboard at `http://127.0.0.1:8081/`. Default-deny: no global allowlist — projects without a configured allowlist hold every request for manual approval.
+- Has backend services (postgres, redis, etc.) from `.bach.toml` running on the same network, reachable from the session container by short name (Docker resolves natively via bridge DNS).
 - Inherits the host's Claude Code auth via a long-lived OAuth setup-token (`sk-ant-oat01-...`, valid ~1 year), minted on the host once via `bach setup-claude-token` (which wraps `claude setup-token`) and stored in the macOS keychain under service `bach: Claude Code OAuth Token`. The wrapper reads the token from keychain on every session start and passes it into the container as `CLAUDE_CODE_OAUTH_TOKEN`. No `.credentials.json` is staged into the container. The setup-token is independent of the interactive `claude /login` OAuth flow, so concurrent bach sessions and a host `claude` process can coexist without rotating each other's refresh tokens. Sessions remain interactive (TTY + human in the loop), so usage bills against the Max subscription (the Jun 15 2026 policy change shifts only the headless/Agent-SDK path off subscription).
 - Inherits the host's GitHub auth: `gh auth token` exported as `GH_TOKEN`. The base image bakes in a system-wide git credential helper (`!gh auth git-credential`) for `github.com` + `gist.github.com`, so `git push` over HTTPS Just Works inside the sandbox using the same token.
 - Persists conversation history under `~/.local/share/bach/projects/<project>/` (bind mount, allows concurrent sessions on different projects without volume contention).
@@ -20,7 +20,7 @@ Sandboxed Claude Code in a Linux container. Pluggable backend (Docker, default; 
 ```
 bach              # Python 3 CLI (single file, stdlib only). Symlinked to ~/.local/bin/bach.
 Dockerfile        # bach:base. Debian trixie-slim + claude + mise + gh credential helper + entrypoint.
-entrypoint.sh     # Runs as root: seeds ~/.claude (+ gh config + onboarding), applies BACH_HOSTS,
+entrypoint.sh     # Runs as root: seeds ~/.claude (+ gh config + onboarding), applies
                   # BACH_ALIASES, [[stage]] manifest, clone-mode worktree init,
                   # [[cache]] overlay warm/promote, exports HOME/USER/LOGNAME/SHELL,
                   # then runuser --preserve-environment to agent.
@@ -40,9 +40,7 @@ README.md         # User-facing docs.
 - `~/.local/share/bach/cache/mise/` — mise tool cache (bind mount into all sessions)
 - `~/.local/share/bach/cache/projects/<proj>/<slug>/` — per-project `[[cache]]` host base
 - `~/.local/share/bach/projects/<proj>/` — claude conversation history per project (bind mount)
-- `~/.local/state/bach/proxy.log` — bach-proxy log (Apple backend; docker backend uses `docker logs bach-proxy`)
-- `~/.local/state/bach/proxy.{pid,err}` — host-side proxy process state (Apple)
-- `~/.local/state/bach/proxy-bin/bach-proxy` — host-built proxy binary (Apple)
+- bach-proxy log — `docker logs bach-proxy`
 - `~/.local/state/bach/runtime/` — staged files (mode 0700); CLAUDE.md + `[[stage]]` files + cache-manifest
 - `~/.local/state/bach/build/<hash>/Dockerfile` — generated per-project image build dirs
 - `~/.local/state/bach/ports.json` — sticky port allocations per (project, name)
@@ -55,12 +53,11 @@ Walked up from `cwd`. Project root = the dir containing `.bach.toml` (or `cwd` i
 A user-level file at `$XDG_CONFIG_HOME/bach/config.toml` (default `~/.config/bach/config.toml`) is loaded first and the project's `.bach.toml` is layered on top. Same schema. Merge in `merge_configs()`:
 - Lists concat: `apt_packages`, `ports`, `allowlist`, `denylist`, `stage`, `mounts`, `cache`, `volumes`, `install`.
 - Tables merge by key, later wins per key: `env`, `aliases`. `services` is replace-by-name (collision = project's spec wins entirely, no deep merge).
-- Scalars last-wins (`backend`, `image`, `mise_cache`).
+- Scalars last-wins (`image`, `mise_cache`).
 
 `[[mounts]].source` is `expanduser`'d, so user-level mounts can use `~/...` (e.g. `~/.config/nvim`). Relative sources still resolve against the project root. Optional `chown = true` per mount adds the target to `BACH_CHOWN` env (newline-separated); the entrypoint chowns each non-recursively to agent. Needed for writable bind mounts under `/home/agent` because VirtioFS preserves the host uid on bind mounts (a host dir owned by 501:20 appears as 501:20 inside the container, so agent/1000 can't write). Non-recursive is enough: future files agent creates inherit agent ownership. Ignored when `readonly = true`. Do not enable for host trees outside the bach cache area — chown propagates back to the host via VirtioFS.
 
 ```toml
-backend = "docker"                                 # or "apple". Default docker.
 image = "bach:base"                                # override the session image
 mise_cache = true
 
@@ -153,16 +150,14 @@ volume_init_owner = "10001:10001"
 
 ## Test bed
 
-A real-world project with a working `.bach.toml` is used for iteration. Typical service mix: postgres, redis, dynamodb, rustfs (volume-init pattern), plus a private ghcr.io image (works under Docker backend via `gh auth token` → `docker login`).
+A real-world project with a working `.bach.toml` is used for iteration. Typical service mix: postgres, redis, dynamodb, rustfs (volume-init pattern), plus a private ghcr.io image (works via `gh auth token` → `docker login`).
 
-## Backends
+## Backend
 
-Backend selection: `.bach.toml` key `backend = "docker"` (default) or `"apple"`. Implementation in `bach` as `DockerBackend` / `AppleBackend` subclasses of `Backend`. Adding a third backend means another subclass; call sites use `backend.<method>`.
-
-**Why Docker is the default**: Apple container has a known keychain bug (apple/container#1253 / PR #1257) — the `container-core-images` helper subprocess can't read credentials the CLI just wrote because they live in different keychain access groups. Pull of any private image fails with `errSecInteractionNotAllowed (-25308)`. Until that fix ships, Apple backend is unusable for any project that needs private images. The bach `AppleBackend` keeps the registry-login plumbing wired up so it'll Just Work once #1257 lands.
+Docker only. Implemented in `bach` as `DockerBackend`, a subclass of the abstract `Backend`. The abstraction is the seam for adding another backend later (another subclass); call sites use `backend.<method>`. `select_backend` accepts `backend = "docker"` for forward-compat and errors on anything else.
 
 **Docker backend specifics**:
-- Proxy is a single shared container (`bach-proxy`, locally-built `bach-proxy:latest`) on a shared `bach-internet` bridge plus every project's `--internal` network. Containers reach it by DNS (`bach-proxy`). The internal network has no NAT — direct egress is genuinely blocked, only the proxy has dual-homed egress. Same isolation property as Apple's gateway model, different mechanism.
+- Proxy is a single shared container (`bach-proxy`, locally-built `bach-proxy:latest`) on a shared `bach-internet` bridge plus every project's `--internal` network. Containers reach it by DNS (`bach-proxy`). The internal network has no NAT — direct egress is genuinely blocked, only the proxy has dual-homed egress.
 - Proxy image is built lazily on first `bach up` from `proxy/Dockerfile`. The proxy container is labeled with the source image digest; bach recreates the container when the image is rebuilt so code changes propagate.
 - Dashboard port (8081) is published to `127.0.0.1` on the host only. Inside the proxy, the dashboard listener checks the local-arrival IP against `BACH_DASH_ALLOW_CIDR` (= bach-internet's subnet, resolved at start); a session container hitting `bach-proxy:8081` lands on the project-network interface and is rejected. Belt + braces.
 - **TCP forwarder for `[[ports]]`.** `--internal` networks silently drop `-p` publishing, so the proxy container itself pre-publishes a contiguous host port range (`PORT_ALLOC_START..PORT_ALLOC_END`, default 4100–4199; bumped via `BACH_FORWARD_RANGE` env on the proxy and matching constants on the bach side). bach POSTs `{project, forwards:[{host_port, container_ip, container_port}]}` to `/forwards` after `docker run`; the proxy starts a listener per host port and TCP-forwards to the session container's IP on its `--internal` network. The forwarder uses the same local-arrival-CIDR check as the dashboard — session-to-session loop-back via `bach-proxy:<port>` is rejected on accept. The proxy container is re-created when the port range changes (label `bach.proxy.port_range`).
@@ -173,20 +168,10 @@ Backend selection: `.bach.toml` key `backend = "docker"` (default) or `"apple"`.
 - Re-registration is fire-and-forget on every `bach <anything-that-spawns>` and `bach up`. If the proxy container restarts (and loses memory), the next bach action re-registers. Edge case: an in-flight session container talking to a freshly-restarted proxy with no registration will see its requests held as pending until the next bach invocation; not worth persisting registrations to disk yet.
 - Project name on the dashboard = the project root directory name (e.g. `myproj`), not the docker network name (`bach-myproj`).
 - Approvals + temp-allow entries are scoped by `project|host`, so allowing `api.foo.example` from project A does not allow it from project B.
-- Service-name DNS is native to Docker bridge networks; `BACH_HOSTS` injection is skipped.
-- Volume ownership inherits from image FS on first mount, which is the wrong thing for images whose runtime uid differs from their on-disk uid (e.g. `amazon/dynamodb-local`: image dir is root-owned, process runs as dynamodblocal/1000 → SQLite fails to open). `volume_init_owner` runs a one-shot alpine `chown -R` on the named volume; same impl on both backends.
+- Service-name DNS is native to Docker bridge networks.
+- Volume ownership inherits from image FS on first mount, which is the wrong thing for images whose runtime uid differs from their on-disk uid (e.g. `amazon/dynamodb-local`: image dir is root-owned, process runs as dynamodblocal/1000 → SQLite fails to open). `volume_init_owner` runs a one-shot alpine `chown -R` on the named volume.
 - Registry auth: idempotent `docker login` from `gh auth token` once per process. Don't trust `~/.docker/config.json`'s `auths.<host>: {}` — that entry doesn't carry the credential, which lives in the OS cred helper and may be stale.
-
-**Apple backend quirks** (don't unwind without reason):
-
-1. **Volumes start root-owned with `lost+found`.** Apple container doesn't copy image-dir ownership on first mount. `volume_init_owner` triggers a pre-chown via a one-shot alpine container, and postgres uses `PGDATA=<subdir>` to avoid `lost+found`.
-2. **No automatic DNS for container names on a custom network.** Wrapper inspects each service's `ipv4Address` after start, writes `BACH_HOSTS` env, entrypoint appends to `/etc/hosts`.
-3. **No `--add-host` flag on `container run`.** Hence the env-var/entrypoint dance above.
-4. **Same named volume can't mount into two containers concurrently.** This is why mise cache and projects history are bind mounts, not named volumes. Service data volumes (postgres etc) stay as named volumes — single-tenant per project.
-5. **`container container inspect` is wrong**; container inspect is the top-level `container inspect <name>`. The wrapper's `inspect()` special-cases `container` vs `network`/`volume`/`image`.
-6. **`-it` without a real TTY fails with NSPOSIXErrorDomain Code=19.** Wrapper checks `sys.stdin.isatty()` and picks `-i` or `-it`. (Docker has the same fix; harmless on both.)
-7. **The host gateway IP per network is `<subnet>.1`.** Wrapper reads it from `container network inspect <net>.status.ipv4Gateway`.
-8. **Registry auth doesn't survive the helper-subprocess hop.** See above.
+- `-it` without a real TTY fails; the wrapper checks `sys.stdin.isatty()` and picks `-i` or `-it`.
 
 ## Container env / privilege model
 
@@ -200,10 +185,9 @@ When `.bach.toml` has `apt_packages`, the wrapper generates a tiny Dockerfile (`
 
 ## Network lockdown
 
-- Project network created with `--internal` (both backends). No NAT to internet from inside the project network.
-- Docker: session container reaches the dual-homed `bach-proxy` by DNS over the internal network. Direct egress attempts fail at DNS (curl `Could not resolve host`). Verified.
-- Apple: session container reaches host bach-proxy via the network gateway IP. Resolv.conf points there; DNS only resolves via proxy-tunnelled CONNECTs. Verified (`HTTPS_PROXY= curl …` times out with rc=28).
-- `HTTPS_PROXY` / `HTTP_PROXY` (+ lowercase) set per-backend. NO_PROXY includes the proxy hostname/IP and service short names.
+- Project network created with `--internal`. No NAT to internet from inside the project network.
+- Session container reaches the dual-homed `bach-proxy` by DNS over the internal network. Direct egress attempts fail at DNS (curl `Could not resolve host`). Verified.
+- `HTTPS_PROXY` / `HTTP_PROXY` (+ lowercase) set in the session env. NO_PROXY includes the proxy hostname/IP and service short names.
 - Claude, npm, git over HTTPS, curl — all respect `HTTPS_PROXY`. SSH/git+ssh outbound is blocked (no path) — not a goal yet.
 
 ## Subcommands
@@ -215,7 +199,7 @@ When `.bach.toml` has `apt_packages`, the wrapper generates a tiny Dockerfile (`
 - `bach ps` — list this project's running session containers.
 - `bach up` / `bach down` — start/stop the proxy + backend services for the project.
 - `bach status` — project, backend, proxy, and service state.
-- `bach log` — `docker logs --tail 50 bach-proxy` (Docker) / `tail -50 ~/.local/state/bach/proxy.log` (Apple).
+- `bach log` — `docker logs --tail 50 bach-proxy`.
 - `bach build` — rebuild `bach:base` from this repo's Dockerfile. Per-project images auto-invalidate on next session (their hash includes the base image digest).
 
 Source mode is set via `.bach.toml` `source_mode = "auto" | "clone" | "bind"` (default `auto`). No CLI flag — was previously `--no-clone`, removed in favour of the TOML knob.
@@ -238,7 +222,7 @@ Recently shipped (don't reintroduce as deferred): clone-RO source mode is the de
 - **No bind-mount of host `~/.claude`.** Container's claude config is ephemeral. Auth comes in as the `CLAUDE_CODE_OAUTH_TOKEN` env var (long-lived setup-token from the host keychain, see above); conversation history is its own bind mount under `~/.local/share/bach/projects/<proj>/`; the host's `CLAUDE.md` is staged in with a bach sandbox-awareness suffix appended (so the agent knows how to ask the user to approve a host via the proxy dashboard); skills are opt-in via `[[stage]]`. Settings, history, etc. are not exposed.
 - **No sudo for `agent`.** Privileged ops happen in entrypoint as root, then drop. Reason: user explicitly stated "I never want to run anything as root" for service containers — kept the principle for the session container too.
 - **XDG paths, not `~/.bach/`.** Reason: user preference (`~/.bach` style is dated).
-- **Bind mounts for mise cache + projects history**, named volumes only for per-project service data. Reason: Apple container doesn't allow concurrent named-volume mounts, but the whole point of bach is parallel sessions.
+- **Bind mounts for mise cache + projects history**, named volumes only for per-project service data. Original reason: the (now-removed) Apple backend couldn't mount a named volume into two containers concurrently, and parallel sessions are the whole point of bach. Kept as-is — bind mounts also give host-side visibility of the cache/history and are battle-tested here.
 - **Threat model is "claude does dumb things, not actively malicious."** Default source mode is clone-from-host-RO (`.git` mounted read-only, worktree backed by alternates; changes only persist via `git push`), which already covers most of the "stop claude from blasting the host tree" case. `source_mode = "bind"` falls back to a RW bind for users who want host-side edits live. Sandbox isolates blast radius from host, not session-to-session. If threat shifts to active-malicious, the stricter knobs left are: force `source_mode = "clone"` everywhere, tighten the proxy allowlist per-project, and revisit `agent` having any FS writes outside `/work`.
 
 ## Recent session (this one) achievements

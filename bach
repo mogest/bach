@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bach — sandboxed claude in a microVM (Apple container) or Linux container (Docker)."""
+"""bach — sandboxed claude in a Linux container (Docker)."""
 
 from __future__ import annotations
 
@@ -572,7 +572,8 @@ def gh_token_for(host: str) -> tuple[str, str]:
 # ---------- backend abstraction ----------
 
 class Backend:
-    """Abstract container backend. Apple `container` or Docker."""
+    """Abstract container backend. Docker today; the seam exists so another
+    backend can be added as a subclass (call sites are backend-agnostic)."""
     name: str = ""
     cli: str = ""
 
@@ -592,8 +593,8 @@ class Backend:
     def chown_volume(self, name: str, owner: str) -> None:
         """Chown the volume contents to `owner` (e.g. "1000:1000") via a
         one-shot alpine container. Needed when a service runs as non-root
-        but the image's volume dir is shipped root-owned (dynamodb-local
-        on Docker, most volumes on Apple)."""
+        but the image's volume dir is shipped root-owned (e.g.
+        dynamodb-local)."""
         run([
             self.cli, "run", "--rm",
             "--mount", f"type=volume,source={name},target=/v",
@@ -621,11 +622,6 @@ class Backend:
     def ensure_registry_auth(self, image: str) -> None:
         """Log into the image's registry on the host if needed. Per-process
         cached to avoid repeated `gh` calls."""
-
-    def injects_hosts(self) -> bool:
-        """True if service-name DNS doesn't work natively and bach must
-        write /etc/hosts entries via BACH_HOSTS env."""
-        return False
 
     def proxy_host(self, net: str) -> str:
         """Hostname/IP the session container should use for HTTPS_PROXY."""
@@ -659,242 +655,6 @@ class Backend:
         """Names of all running bach session containers across all projects.
         Used by the port reaper to drop stale allocations."""
         raise NotImplementedError
-
-
-# ---------- Apple `container` backend ----------
-
-class AppleBackend(Backend):
-    name = "apple"
-    cli = "container"
-
-    def inspect(self, kind: str, name: str) -> dict | None:
-        # `container inspect <name>` for containers; `container <kind> inspect <name>` otherwise.
-        cmd = [self.cli, "inspect", name] if kind == "container" else [self.cli, kind, "inspect", name]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            return None
-        try:
-            data = json.loads(res.stdout)
-            return data[0] if data else None
-        except (json.JSONDecodeError, IndexError):
-            return None
-
-    def ensure_network(self, net: str) -> None:
-        if not self.network_exists(net):
-            run([self.cli, "network", "create", "--internal", net])
-
-    def container_state(self, name: str) -> str:
-        data = self.inspect("container", name)
-        if data is None:
-            return "absent"
-        return data.get("status", "stopped")
-
-    def container_ip(self, name: str, net: str | None = None) -> str | None:
-        data = self.inspect("container", name)
-        if not data:
-            return None
-        for n in data.get("networks", []):
-            addr = n.get("ipv4Address")
-            if addr:
-                return addr.split("/")[0]
-        return None
-
-    def image_digest(self, ref: str) -> str:
-        info = self.image_inspect(ref) or {}
-        return (info.get("index") or {}).get("digest", "")
-
-    def ensure_registry_auth(self, image: str) -> None:
-        # Apple container has a known upstream keychain bug (apple/container#1253,
-        # PR #1257) that breaks pulls after registry login. Implementation
-        # mirrors the Docker path for when that lands; today it's effectively
-        # unusable for private images.
-        host = image_registry(image)
-        if host in _apple_authed:
-            return
-        if host != "ghcr.io":
-            return
-        res = subprocess.run([self.cli, "registry", "list"], capture_output=True, text=True)
-        if res.returncode == 0:
-            for line in res.stdout.splitlines()[1:]:
-                if line.split()[:1] == [host]:
-                    _apple_authed.add(host)
-                    return
-        username, token = gh_token_for(host)
-        print(f"bach: logging in to {host} as {username}")
-        res = subprocess.run(
-            [self.cli, "registry", "login", "-u", username, "--password-stdin", host],
-            input=token, capture_output=True, text=True,
-        )
-        if res.returncode != 0:
-            raise RuntimeError(
-                f"`container registry login {host}` failed: "
-                f"{(res.stderr or res.stdout).strip()}"
-            )
-        _apple_authed.add(host)
-
-    def injects_hosts(self) -> bool:
-        return True
-
-    def proxy_host(self, net: str) -> str:
-        data = self.inspect("network", net)
-        if data is None:
-            raise RuntimeError(f"apple network {net} missing")
-        return data["status"]["ipv4Gateway"]
-
-    def network_cidr(self, net: str) -> str:
-        data = self.inspect("network", net)
-        if data is None:
-            raise RuntimeError(f"apple network {net} missing")
-        status = data.get("status") or {}
-        for key in ("ipv4Subnet", "subnet", "cidr", "ipv4Range"):
-            v = status.get(key)
-            if v:
-                return v
-        raise RuntimeError(
-            f"no subnet on apple network {net} (status keys: {list(status.keys())})"
-        )
-
-    # Host-side bach-proxy (Go). Built from BACH_REPO/proxy on first run.
-    def ensure_proxy(self, net: str) -> None:
-        if self._proxy_pid():
-            return
-        BACH_STATE.mkdir(parents=True, exist_ok=True)
-        bin_path = self._ensure_proxy_binary()
-        log_path = BACH_STATE / "proxy.log"
-        err_path = BACH_STATE / "proxy.err"
-        env = os.environ.copy()
-        # Dashboard listens on host loopback; sessions can only reach the proxy
-        # itself via the per-project network gateway.
-        env["BACH_PROXY_LISTEN"] = f":{PROXY_PORT}"
-        env["BACH_DASH_LISTEN"] = f"127.0.0.1:{PROXY_DASH_PORT}"
-        env["BACH_DASH_ALLOW_CIDR"] = "127.0.0.0/8"
-        log_f = open(log_path, "a")
-        err_f = open(err_path, "w")
-        proc = subprocess.Popen(
-            [str(bin_path)],
-            stdout=log_f,
-            stderr=err_f,
-            env=env,
-            start_new_session=True,
-        )
-        (BACH_STATE / "proxy.pid").write_text(str(proc.pid))
-        deadline = time.time() + 15.0
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError(f"bach-proxy exited (status {proc.returncode}); see {err_path}")
-            try:
-                with socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=0.2):
-                    print(f"bach: proxy started (pid {proc.pid})  dashboard http://127.0.0.1:{PROXY_DASH_PORT}/")
-                    return
-            except OSError:
-                time.sleep(0.2)
-        raise RuntimeError(f"bach-proxy didn't open port within 15s; see {err_path}")
-
-    def _ensure_proxy_binary(self) -> pathlib.Path:
-        src_dir = BACH_REPO / "proxy"
-        bin_dir = BACH_STATE / "proxy-bin"
-        bin_dir.mkdir(parents=True, exist_ok=True)
-        bin_path = bin_dir / "bach-proxy"
-        src = src_dir / "main.go"
-        if bin_path.exists() and bin_path.stat().st_mtime >= src.stat().st_mtime:
-            return bin_path
-        if shutil.which("go") is None:
-            raise RuntimeError(
-                "`go` is required to build the bach proxy on the Apple backend. "
-                "Install Go (e.g. `brew install go`) and rerun."
-            )
-        print(f"bach: building bach-proxy -> {bin_path}")
-        res = subprocess.run(
-            ["go", "build", "-trimpath", "-ldflags=-s -w", "-o", str(bin_path), "."],
-            cwd=src_dir, capture_output=True, text=True,
-        )
-        if res.returncode != 0:
-            raise RuntimeError(f"go build failed: {(res.stderr or res.stdout).strip()}")
-        return bin_path
-
-    def stop_proxy(self) -> None:
-        pid_file = BACH_STATE / "proxy.pid"
-        if not pid_file.exists():
-            return
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, signal.SIGTERM)
-        except (OSError, ValueError):
-            pass
-        pid_file.unlink(missing_ok=True)
-
-    def proxy_status(self) -> str:
-        pid = self._proxy_pid()
-        if pid:
-            return f"running pid {pid}  dashboard http://127.0.0.1:{PROXY_DASH_PORT}/"
-        return "not running"
-
-    def proxy_log_cmd(self) -> list[str] | None:
-        log = BACH_STATE / "proxy.log"
-        if not log.exists():
-            return None
-        return ["tail", "-50", str(log)]
-
-    def _proxy_pid(self) -> int | None:
-        pid_file = BACH_STATE / "proxy.pid"
-        if not pid_file.exists():
-            return None
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-            with socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=0.5):
-                return pid
-        except (OSError, ValueError):
-            pid_file.unlink(missing_ok=True)
-            return None
-
-    def list_running_sessions(self, project_id: str) -> list[str]:
-        # Apple `container ls` lacks docker's --filter label= syntax.
-        # Fall back to name-prefix matching, which is reliable because
-        # session() names every session container `cn(root, "session-<hex>")`.
-        prefix = f"{project_id}-session-"
-        res = subprocess.run(
-            [self.cli, "ls", "--format", "json"],
-            capture_output=True, text=True,
-        )
-        if res.returncode != 0:
-            return []
-        try:
-            data = json.loads(res.stdout or "[]")
-        except json.JSONDecodeError:
-            return []
-        names: list[str] = []
-        for entry in data:
-            cfg = entry.get("configuration") or {}
-            name = cfg.get("id") or entry.get("id") or ""
-            status = entry.get("status", "")
-            if name.startswith(prefix) and status == "running":
-                names.append(name)
-        return names
-
-    def list_all_running_sessions(self) -> list[str]:
-        # `container ls` doesn't filter by label; match `bach-<proj>-session-<hex>`
-        # by name structure.
-        res = subprocess.run(
-            [self.cli, "ls", "--format", "json"],
-            capture_output=True, text=True,
-        )
-        if res.returncode != 0:
-            return []
-        try:
-            data = json.loads(res.stdout or "[]")
-        except json.JSONDecodeError:
-            return []
-        names: list[str] = []
-        for entry in data:
-            cfg = entry.get("configuration") or {}
-            name = cfg.get("id") or entry.get("id") or ""
-            status = entry.get("status", "")
-            if status != "running":
-                continue
-            if re.match(r"^bach-[a-z0-9-]+-session-[0-9a-f]+$", name):
-                names.append(name)
-        return names
 
 
 # ---------- Docker backend ----------
@@ -968,9 +728,6 @@ class DockerBackend(Backend):
                 f"`docker login {host}` failed: {(res.stderr or res.stdout).strip()}"
             )
         _docker_authed.add(host)
-
-    def injects_hosts(self) -> bool:
-        return False
 
     def proxy_host(self, net: str) -> str:
         # The proxy container is joined to every project network and is
@@ -1163,21 +920,17 @@ class DockerBackend(Backend):
         return [n for n in res.stdout.splitlines() if n]
 
 
-# Per-process registry-auth cache, partitioned by backend so a session that
-# (somehow) used both wouldn't cross-trust.
-_apple_authed: set[str] = set()
+# Per-process registry-auth cache.
 _docker_authed: set[str] = set()
 
 
 def select_backend(cfg: dict) -> Backend:
-    """Pick the backend. `.bach.toml` may set `backend = "docker"` or
-    `"apple"`. Default: docker."""
+    """Pick the backend. Docker is the only backend; `.bach.toml`
+    `backend = "docker"` is accepted for forward-compat."""
     name = (cfg.get("backend") or "docker").lower()
-    if name == "apple":
-        return AppleBackend()
     if name == "docker":
         return DockerBackend()
-    raise RuntimeError(f"unknown backend: {name!r} (expected 'docker' or 'apple')")
+    raise RuntimeError(f"unknown backend: {name!r} (expected 'docker')")
 
 
 # ---------- per-project image ----------
@@ -1506,19 +1259,6 @@ def build_aliases(cfg: dict) -> str:
         lines.append(f"alias {k}='{esc}'")
     return "\n".join(lines)
 
-def services_hosts(root: pathlib.Path, cfg: dict, net: str, backend: Backend) -> str:
-    """Apple-only: build BACH_HOSTS string for /etc/hosts injection."""
-    if not backend.injects_hosts():
-        return ""
-    lines = []
-    for svc in cfg.get("services", {}):
-        ip = backend.container_ip(cn(root, svc), net)
-        if ip:
-            lines.append(f"{ip} {svc}")
-        else:
-            print(f"bach: warning: no IP for service {svc}", file=sys.stderr)
-    return "\n".join(lines)
-
 # ---------- session ----------
 
 def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend, *, guard: bool = False, no_publish: bool = False) -> None:
@@ -1573,7 +1313,6 @@ def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend,
     )
 
     image = ensure_project_image(cfg, backend)
-    hosts = services_hosts(root, cfg, net, backend)
     services = list(cfg.get("services", {}).keys())
     proxy = backend.proxy_host(net)
     no_proxy = ",".join(["localhost", "127.0.0.1", proxy, *services])
@@ -1584,6 +1323,7 @@ def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend,
         "--name", session_name,
         "--hostname", session_name,
         "--label", f"bach.project={net}",
+        "--label", f"bach.project_root={root}",
         "--label", "bach.role=session",
         "--network", net,
         "-w", "/work",
@@ -1593,7 +1333,6 @@ def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend,
         "-e", f"https_proxy=http://{proxy}:{PROXY_PORT}",
         "-e", f"NO_PROXY={no_proxy}",
         "-e", f"no_proxy={no_proxy}",
-        "-e", f"BACH_HOSTS={hosts}",
     ]
 
     if use_clone:
@@ -1658,7 +1397,7 @@ def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend,
     # session container's IP on the project network.
 
     # Top-level session volumes. String syntax: "name:/container/path",
-    # matching service `volumes`. Persisted Docker/Apple-container named
+    # matching service `volumes`. Persisted Docker named
     # volumes, shared across every session that references the same name
     # (namespaced `bach-shared-<name>`). Created lazily; chowned to agent
     # only on first creation so subsequent sessions don't pay an alpine
@@ -1940,7 +1679,6 @@ GLOBAL FLAGS
 CONFIG (.bach.toml)
   Walked up from cwd. The directory containing it is the project root.
 
-    backend = "docker"               # or "apple"
     source_mode = "auto"             # auto (default) | clone | bind.
                                      #   auto  — clone if .git, else bind.
                                      #   clone — must clone (error if no .git).
@@ -1987,9 +1725,7 @@ EXAMPLES
 PATHS
   ~/.local/share/bach/projects/<proj>/   Per-project Claude history.
   ~/.local/share/bach/cache/mise/        Shared mise tool cache.
-  ~/.local/state/bach/proxy.log          bach-proxy log (apple backend).
-                                         (docker backend: `bach log` tails
-                                         `docker logs bach-proxy`.)
+  bach log                               Tails `docker logs bach-proxy`.
 """
 
 
