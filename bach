@@ -82,14 +82,140 @@ def merge_configs(base: dict, override: dict) -> dict:
             out[k] = v
     return out
 
+# ---------- config validation ----------
+
+# Full schema for .bach.toml / the user-level config. Anything not listed is
+# either a typo or a key that landed in the wrong table — the classic TOML
+# trap being a bare key written below a [[ports]]-style header, which TOML
+# assigns to that entry rather than the top level. Both are hard errors that
+# name the offending file.
+
+_TOP_SCALARS = {
+    "image": str, "claude_model": str, "source_mode": str, "backend": str,
+    "mise_cache": bool,
+}
+_USER_ONLY_SCALARS = {"proxy_port": int, "proxy_dash_port": int}
+_TOP_STR_LISTS = ("apt_packages", "allowlist", "denylist", "volumes")
+# key -> ({field: type}, {required fields})
+_TOP_TABLE_ARRAYS = {
+    "ports": ({"name": str, "container": int, "host": int, "scheme": str, "hostname": str},
+              {"name", "container"}),
+    "install": ({"name": str, "script": str}, {"script"}),
+    "stage": ({"from": str, "to": str, "mode": str}, {"from", "to"}),
+    "mounts": ({"source": str, "target": str, "readonly": bool, "chown": bool},
+               {"source", "target"}),
+    "cache": ({"path": str, "mode": str}, {"path"}),
+}
+_SERVICE_FIELDS = {
+    "image": str, "env": dict, "volumes": list, "command": (str, list),
+    "volume_init_owner": str, "platform": str,
+}
+_KNOWN_TOP_KEYS = set(_TOP_SCALARS) | set(_USER_ONLY_SCALARS) | set(_TOP_STR_LISTS) \
+    | set(_TOP_TABLE_ARRAYS) | {"env", "aliases", "services"}
+
+def _is_type(v, t) -> bool:
+    # bool subclasses int in Python; an int field must not accept true/false.
+    if t is int:
+        return isinstance(v, int) and not isinstance(v, bool)
+    return isinstance(v, t)
+
+def _type_name(t) -> str:
+    return " or ".join(x.__name__ for x in t) if isinstance(t, tuple) else t.__name__
+
+def _check_fields(entry: dict, fields: dict, required: set, where: str, errors: list) -> None:
+    for f in sorted(required - entry.keys()):
+        errors.append(f"{where}: missing required key `{f}`")
+    for k, v in entry.items():
+        if k not in fields:
+            hint = (" — this is a top-level key; in TOML every key below a [[section]] header"
+                    " belongs to that section, so move it above"
+                    if k in _KNOWN_TOP_KEYS else "")
+            errors.append(f"{where}: unknown key `{k}`{hint}")
+        elif not _is_type(v, fields[k]):
+            errors.append(f"{where}: `{k}` must be {_type_name(fields[k])}")
+
+def validate_config(cfg: dict, user_level: bool = False) -> list:
+    """Schema-check one config file (pre-merge, so errors blame the right
+    file). Returns a list of error strings; empty means valid."""
+    errors: list = []
+    for k in cfg:
+        if k not in _KNOWN_TOP_KEYS:
+            errors.append(f"unknown key `{k}`")
+    for k, t in _TOP_SCALARS.items():
+        if k in cfg and not _is_type(cfg[k], t):
+            errors.append(f"`{k}` must be {_type_name(t)}")
+    for k, t in _USER_ONLY_SCALARS.items():
+        if k not in cfg:
+            continue
+        if not user_level:
+            errors.append(f"`{k}` only takes effect in {USER_CONFIG_PATH}; remove it here")
+        elif not _is_type(cfg[k], t):
+            errors.append(f"`{k}` must be {_type_name(t)}")
+    for k in _TOP_STR_LISTS:
+        v = cfg.get(k)
+        if v is not None and (not isinstance(v, list) or not all(isinstance(x, str) for x in v)):
+            errors.append(f"`{k}` must be a list of strings")
+    for k, (fields, required) in _TOP_TABLE_ARRAYS.items():
+        v = cfg.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, list) or not all(isinstance(e, dict) for e in v):
+            errors.append(f"`{k}` must be an array of tables ([[{k}]])")
+            continue
+        for i, entry in enumerate(v):
+            _check_fields(entry, fields, required, f"[[{k}]] entry {i + 1}", errors)
+    for k in ("env", "aliases"):
+        v = cfg.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, dict):
+            errors.append(f"`{k}` must be a table")
+            continue
+        for name, val in v.items():
+            if k == "aliases" and not isinstance(val, str):
+                errors.append(f"aliases.{name}: must be a string")
+            elif k == "env" and not isinstance(val, (str, int, float, bool)):
+                errors.append(f"env.{name}: must be a scalar (string, number, or bool)")
+    services = cfg.get("services")
+    if services is not None:
+        if not isinstance(services, dict) or not all(isinstance(s, dict) for s in services.values()):
+            errors.append("`services` must be tables ([services.<name>])")
+        else:
+            for name, spec in services.items():
+                where = f"services.{name}"
+                _check_fields(spec, _SERVICE_FIELDS, {"image"}, where, errors)
+                for ek, ev in (spec.get("env") or {}).items() if isinstance(spec.get("env"), dict) else []:
+                    if not isinstance(ev, (str, int, float, bool)):
+                        errors.append(f"{where}.env.{ek}: must be a scalar")
+                vols = spec.get("volumes")
+                if isinstance(vols, list) and not all(isinstance(x, str) and ":" in x for x in vols):
+                    errors.append(f"{where}.volumes: each entry must be a \"name:/mount/path\" string")
+                cmd = spec.get("command")
+                if isinstance(cmd, list) and not all(isinstance(x, str) for x in cmd):
+                    errors.append(f"{where}.command: list entries must be strings")
+    return errors
+
+def load_validated_toml(path: pathlib.Path, user_level: bool = False) -> dict:
+    """Parse + schema-check a config file; exit with errors naming the file."""
+    try:
+        with path.open("rb") as f:
+            cfg = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(f"bach: {path}: TOML parse error: {e}")
+    errors = validate_config(cfg, user_level=user_level)
+    if errors:
+        for err in errors:
+            print(f"bach: {path}: {err}", file=sys.stderr)
+        sys.exit(1)
+    return cfg
+
 def load_user_config() -> dict:
     """Load ~/.config/bach/config.toml (or $XDG_CONFIG_HOME/bach/config.toml)
     if present. Silently absent otherwise. Same schema as .bach.toml; layered
     under it (project wins on conflicts; see merge_configs)."""
     if not USER_CONFIG_PATH.exists():
         return {}
-    with USER_CONFIG_PATH.open("rb") as f:
-        return tomllib.load(f)
+    return load_validated_toml(USER_CONFIG_PATH, user_level=True)
 
 # Proxy ports are intentionally user-level only — one proxy serves all
 # projects, so it must bind the same ports regardless of which project
@@ -108,9 +234,7 @@ def find_project() -> tuple[pathlib.Path, dict]:
     for d in [cwd, *cwd.parents]:
         cfg_path = d / ".bach.toml"
         if cfg_path.exists():
-            with cfg_path.open("rb") as f:
-                project_cfg = tomllib.load(f)
-            return d, merge_configs(user_cfg, project_cfg)
+            return d, merge_configs(user_cfg, load_validated_toml(cfg_path))
     return cwd, user_cfg
 
 
@@ -121,8 +245,7 @@ def load_config_at(root: pathlib.Path) -> dict:
     user_cfg = load_user_config()
     cfg_path = root / ".bach.toml"
     if cfg_path.exists():
-        with cfg_path.open("rb") as f:
-            return merge_configs(user_cfg, tomllib.load(f))
+        return merge_configs(user_cfg, load_validated_toml(cfg_path))
     return user_cfg
 
 def project_id(root: pathlib.Path) -> str:

@@ -4,6 +4,15 @@
 # After `bach`, in the container, services are reachable by short name
 # (postgres, redis, etc.) via /etc/hosts entries bach injects.
 
+# NOTE: bare keys like `mise_cache` must appear ABOVE the first [[section]]
+# or [table] header — in TOML, keys written below a header belong to that
+# section. bach validates this and errors on misplaced keys.
+
+# Persistent named volume for mise's tool cache, shared across all bach
+# projects so identical tool versions only download once. Set to false to
+# disable (each session starts from a clean mise state).
+mise_cache = true
+
 # Forwarded ports. bach picks a free host port starting at 4100; the proxy
 # dashboard shows the assigned URL. Add more entries (e.g. esbuild HMR,
 # LiveDashboard) as needed.
@@ -13,11 +22,6 @@ container = 4000
 # scheme = "https"        # optional, default http (controls the dashboard link)
 # hostname = "app.local"  # optional, default localhost; vanity host shown in the
                           # dashboard link — point it at 127.0.0.1 in /etc/hosts
-
-# Persistent named volume for mise's tool cache, shared across all bach
-# projects so identical tool versions only download once. Set to false to
-# disable (each session starts from a clean mise state).
-mise_cache = true
 
 [services.postgres]
 image = "postgres:16-alpine"
