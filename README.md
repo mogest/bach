@@ -1,4 +1,4 @@
-# bach 🎼
+# bach 🏖️
 
 Run Claude Code in a sandbox, without giving up anything that makes it useful.
 
