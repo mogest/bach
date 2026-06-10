@@ -155,6 +155,31 @@ export LOGNAME=agent
 export SHELL=/bin/bash
 export PATH="/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+# Bind-mode caches (rw/ro, manifest lines with a mode field): docker creates
+# any missing parent dirs of the mount target root-owned at container start,
+# which breaks the clone-mode checkout below (agent can't write into e.g.
+# /work/rails when only /work/rails/vendor/bundle is the mount). Chown the
+# docker-created intermediates back to agent, plus the rw target itself so
+# agent can write into the host cache dir (VirtioFS preserves host uid;
+# best-effort, same as BACH_CHOWN).
+if [ -s /bach-runtime/cache-manifest ]; then
+    while IFS=$'\t' read -r slug target mode; do
+        [ -z "$slug" ] && continue
+        case "${mode:-overlay}" in
+            rw|ro) ;;
+            *) continue ;;
+        esac
+        d=$(dirname "$target")
+        while [[ "$d" == /work/* ]]; do
+            chown agent:agent "$d" 2>/dev/null || true
+            d=$(dirname "$d")
+        done
+        if [ "$mode" = "rw" ]; then
+            chown agent:agent "$target" 2>/dev/null || true
+        fi
+    done < /bach-runtime/cache-manifest
+fi
+
 # Clone mode: host's .git is mounted read-only at /host-git. We skip
 # `git clone` (which silently disables --local/--shared across mount points
 # and ends up copying packs anyway) and manually init a worktree backed by
@@ -188,8 +213,9 @@ fi
 # back on exit (last-writer-wins on concurrent sessions).
 OVERLAY_TARGETS=()
 if [ -s /bach-runtime/cache-manifest ]; then
-    while IFS=$'\t' read -r slug target; do
+    while IFS=$'\t' read -r slug target mode; do
         [ -z "$slug" ] && continue
+        [ "${mode:-overlay}" = "overlay" ] || continue
         [ -d "/bach-cache/$slug" ] || continue
         mkdir -p "$target"
         rsync -a "/bach-cache/$slug/" "$target/" 2>/dev/null || true

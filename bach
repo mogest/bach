@@ -1380,7 +1380,14 @@ def setup_caches(cfg: dict, root: pathlib.Path, rt: pathlib.Path) -> list[str]:
         entrypoint rsyncs base -> /work/<path> at start (warm) and pushes
         /work/<path> -> base on clean exit (promote, last-writer-wins).
         Each session has its own writable copy in /work, so concurrent
-        sessions can't corrupt each other mid-build."""
+        sessions can't corrupt each other mid-build.
+
+    All entries go in the manifest. Overlay lines stay two-field (slug,
+    target) so an older baked-in entrypoint still parses them; rw/ro lines
+    add the mode as a third field — the entrypoint chowns the root-owned
+    intermediate dirs docker creates for the mount target, which would
+    otherwise break the clone-mode checkout into /work. (Old entrypoints
+    skip rw/ro lines via their /bach-cache/<slug> existence check.)"""
     (rt / "cache-manifest").unlink(missing_ok=True)
     entries = cfg.get("cache", []) or []
     if not entries:
@@ -1398,8 +1405,10 @@ def setup_caches(cfg: dict, root: pathlib.Path, rt: pathlib.Path) -> list[str]:
         target = f"/work/{path}"
         if mode == "ro":
             flags += ["--mount", f"type=bind,source={host_dir},target={target},readonly"]
+            manifest.append(f"{slug}\t{target}\t{mode}")
         elif mode == "rw":
             flags += ["--mount", f"type=bind,source={host_dir},target={target}"]
+            manifest.append(f"{slug}\t{target}\t{mode}")
         else:
             flags += ["--mount", f"type=bind,source={host_dir},target=/bach-cache/{slug}"]
             manifest.append(f"{slug}\t{target}")
