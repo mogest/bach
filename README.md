@@ -1,36 +1,142 @@
-# bach
+# bach 🎼
 
-Sandboxed Claude Code in a Linux container. Per-project network, allowlisted
-HTTP/CONNECT proxy, optional backend services (postgres, redis, …) declared in
-`.bach.toml`. macOS host today; runs on Docker.
+Run Claude Code in a sandbox, without giving up anything that makes it useful.
+
+`bach` spawns Claude Code (or just a shell) inside a locked-down Linux
+container, per project. Claude gets your project source, your language
+toolchains, your backend services (postgres, redis, whatever you declare) —
+but it can't touch the rest of your Mac, and every outbound network request
+goes through an allowlisting proxy you control from a live dashboard.
+
+The nice part: it feels like running `claude` normally. Your Claude
+subscription, your GitHub auth, and your conversation history all carry over
+automatically. You `cd` into a project, type `bach c`, and you're working.
+
+## What you get
+
+- **Real isolation** — each project runs on its own internal Docker network
+  with zero direct internet access. The only way out is through `bach-proxy`,
+  which enforces a per-project hostname allowlist.
+- **A live dashboard** at `http://127.0.0.1:8081/` — watch requests stream by,
+  approve unknown hosts with one click, see forwarded ports.
+- **Safe-by-default source handling** — by default your project is *cloned*
+  into the container (read-only `.git` + git worktree magic, so it's instant
+  and costs ~no disk). Claude can't trash your working tree; changes only
+  escape via `git push`.
+- **Backend services from one TOML file** — declare postgres/redis/etc in
+  `.bach.toml` and they're up, networked, and resolvable by short name.
+- **No rebuild treadmill** — the Claude binary is cached on the host and
+  mounted in, so Claude updates never require an image rebuild.
 
 ## Status
 
-Single-machine, single-user, dev-only. Threat model is "Claude does dumb things",
-not "Claude is actively malicious."
+Single-machine, single-user, dev-only. The threat model is "Claude does dumb
+things", not "Claude is actively malicious."
 
-## Requirements
+## Installation
 
-- macOS on Apple Silicon
-- Docker
-- `gh` CLI logged in (used for: propagating GitHub auth into the sandbox, and `docker login` for `ghcr.io`)
+You'll need about ten minutes, most of it waiting for the image build.
+
+### 1. Prerequisites
+
+- A Mac with **Apple Silicon**.
+- **Docker** with a running daemon — [OrbStack](https://orbstack.dev/) or
+  [Docker Desktop](https://www.docker.com/products/docker-desktop/) both work:
+
+  ```sh
+  brew install orbstack          # or: brew install --cask docker
+  ```
+
+  (Plain `brew install docker` only installs the CLI — you need a daemon too.)
+
+- **Python 3.11+** on your PATH. Note the python3 bundled with macOS is too
+  old (3.9), so if `python3 --version` says < 3.11:
+
+  ```sh
+  brew install python
+  ```
+
+- The **GitHub CLI**, logged in. bach uses it to pass your GitHub auth into
+  the sandbox (so `git push` and `gh` just work) and to log in to `ghcr.io`:
+
+  ```sh
+  brew install gh
+  gh auth login
+  ```
+
+- **Claude Code** installed on your Mac, with an active subscription. If you
+  don't have it yet:
+
+  ```sh
+  curl -fsSL https://claude.ai/install.sh | bash
+  ```
+
+### 2. Get bach
+
+Clone the repo and symlink the `bach` script somewhere on your PATH:
 
 ```sh
-brew install docker gh
-```
-
-## Install
-
-```sh
-git clone … bach
+git clone https://github.com/mogest/bach.git
 cd bach
-docker build -t bach:base .
+mkdir -p ~/.local/bin
 ln -s "$PWD/bach" ~/.local/bin/bach
 ```
 
-The `bach-proxy` container image is built lazily on first use.
+If `~/.local/bin` isn't already on your PATH, add it to your shell profile:
 
-## Use
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### 3. Build the base image
+
+From anywhere (bach finds its own repo through the symlink):
+
+```sh
+bach build
+```
+
+This builds the `bach:base` Debian image. Takes a few minutes the first time.
+The `bach-proxy` image builds itself automatically the first time you start a
+session, so there's nothing else to build.
+
+### 4. Connect your Claude subscription
+
+One-time setup — mint a long-lived OAuth token and store it in your macOS
+keychain:
+
+```sh
+bach setup-claude-token
+```
+
+This runs `claude setup-token`, which opens a browser window to authorise.
+When it prints your `sk-ant-oat01-...` token, copy it and paste it at the
+prompt. bach stores it in the keychain (service: `bach: Claude Code OAuth
+Token`) and passes it into every session. It's valid for about a year and is
+independent of your normal `claude` login, so host and sandbox sessions never
+fight over credentials.
+
+### 5. Take it for a spin
+
+```sh
+cd ~/code/some-project
+bach c
+```
+
+First run downloads the Claude binary into the host cache and starts the
+proxy — give it a few seconds. Then Claude opens, already trusted in `/work`,
+ready to go.
+
+Open the dashboard at **http://127.0.0.1:8081/** in a browser. When Claude
+(or anything in the sandbox) tries to reach a host that isn't on the
+project's allowlist, the request is held there for ~5 seconds waiting for
+your click. Approve it and it's allowed for 10 minutes; ignore it and it gets
+a 403. To stop approving the same hosts over and over, add them to
+`allowlist` in the project's `.bach.toml` (see below).
+
+That's it — you're installed. 🎉
+
+## Everyday use
 
 From any project directory:
 
@@ -46,15 +152,17 @@ bach up                 # start proxy + services from .bach.toml
 bach down               # stop this project's services
 bach status             # project, backend, proxy, services
 bach log                # tail the bach-proxy log
-bach build              # rebuild bach:base from this repo's Dockerfile
+bach build              # rebuild bach:base (only needed when this repo changes)
 ```
 
-Without a `.bach.toml`, bach still works — no services, just the session
-container with proxy and default-deny allowlist (every request is held for
-manual approval on the dashboard).
+A project doesn't need a `.bach.toml` — without one you still get the
+sandboxed session and the proxy, just with no services and a default-deny
+allowlist (every request held for manual approval on the dashboard). Add a
+`.bach.toml` when you want allowlisted hosts, services, ports, or extra
+packages.
 
-The proxy dashboard lives at `http://127.0.0.1:8081/` — live event stream,
-pending approvals, temp-allow controls.
+Multiple sessions are fine: run several projects at once, or several sessions
+of the same project side by side.
 
 ## Source mode
 
@@ -71,6 +179,8 @@ the host's object store. Result: near-instant, near-zero extra disk, new
 commits land in `/work/.git/objects` (ephemeral with the session container).
 The session's `origin` is set to the host's `remote.origin.url`, rewritten to
 HTTPS so `git push` works through the proxy with the propagated `GH_TOKEN`.
+Uncommitted host changes aren't visible in the session — commit (or stash)
+first, or use bind mode.
 
 In **bind** mode, host edits are live inside the session and vice versa.
 
@@ -86,6 +196,7 @@ same env var. For `ghcr.io` pulls, the same token is fed to `docker login`
 ## Config (`.bach.toml`)
 
 Walked up from the cwd. The directory containing it is the project root.
+See `examples/example.bach.toml` for a working multi-service example.
 
 ```toml
 source_mode = "auto"                # auto (default) | clone | bind. See *Source mode*.
@@ -191,8 +302,6 @@ volumes = ["redis-data:/data"]
 # platform = "linux/amd64"             # force Rosetta for amd64-only images
 ```
 
-See `examples/example.bach.toml` for a multi-service example.
-
 ## User-level config (`~/.config/bach/config.toml`)
 
 Same schema as `.bach.toml`. Layered **under** the project file (project wins
@@ -236,6 +345,27 @@ Caveat: the share-dir mount is shared across all running sessions. For nvim
 plugin files that's normally OK; for plugin-manager lock files (lazy-lock.json,
 etc.) avoid running updates from two sessions concurrently.
 
+## Troubleshooting
+
+**"no Claude Code OAuth token in keychain"** — you skipped step 4. Run
+`bach setup-claude-token`.
+
+**Requests failing with 403 / curl stalling then failing** — the host isn't
+on the project's allowlist. Open `http://127.0.0.1:8081/` and approve it
+(lasts 10 minutes), or add the hostname to `allowlist` in `.bach.toml`
+permanently. The agent inside the session knows to ask you to do this.
+
+**`bach: command not found`** — `~/.local/bin` isn't on your PATH; see step 2.
+
+**`ModuleNotFoundError: tomllib`** — your `python3` is older than 3.11;
+`brew install python`.
+
+**Image `bach:base` not found** — run `bach build` (step 3).
+
+**Claude or a service can't be reached / weird network state** — `bach status`
+to see what's running, `bach log` to tail the proxy, `bach down && bach up`
+to bounce services.
+
 ## How it works
 
 - **Network**: each project gets its own `--internal` network. No NAT to the
@@ -251,10 +381,10 @@ etc.) avoid running updates from two sessions concurrently.
 - **Services** (`[services.<name>]`): each becomes a container named
   `bach-<project>-<svc>` on the project network. Reached from the session
   container by short name (`postgres`, `redis`, …) via Docker bridge DNS.
-- **Credentials**: host's Claude Code OAuth token is extracted from the macOS
-  keychain into a 0700 staging dir, mounted read-only at `/bach-runtime`; the
-  entrypoint copies it into the ephemeral `~/.claude` of the session
-  container. The host `~/.claude` is never bind-mounted.
+- **Credentials**: the long-lived Claude OAuth token is read from the macOS
+  keychain on every session start and passed into the container as the
+  `CLAUDE_CODE_OAUTH_TOKEN` env var. The host `~/.claude` is never
+  bind-mounted; the session's Claude config is ephemeral.
 - **Caches**: mise tool cache at `~/.local/share/bach/cache/mise/` is shared
   across all projects. Per-project conversation history at
   `~/.local/share/bach/projects/<proj>/`. Per-project build caches (`[[cache]]`)
