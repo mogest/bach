@@ -148,6 +148,7 @@ bach c --resume         # claude with args
 bach run pnpm install   # one-off command in a fresh session
 bach exec               # attach a shell to an already-running session
 bach exec ls /work      # one-off command in a running session
+bach clip               # host clipboard -> file in the session's /shared dir
 bach ps                 # list running sessions for this project
 bach up                 # start proxy + services from .bach.toml
 bach down               # stop this project's services
@@ -164,6 +165,25 @@ packages.
 
 Multiple sessions are fine: run several projects at once, or several sessions
 of the same project side by side.
+
+### The shared directory
+
+Every session gets its own host directory at
+`~/.local/share/bach/shares/<session>/`, mounted read-write inside the
+container at `/shared`. The staged CLAUDE.md tells
+claude to write anything you need to see outside the container (reports,
+images, rendered output, patches) there, so it shows up on your Mac the
+moment it's written.
+
+It works the other way too: `bach clip` saves your current clipboard — text
+or an image — as a file in a running session's `/shared`, then puts the
+in-container path (`/shared/clip-<timestamp>.png`) on your clipboard so you
+can paste it straight into claude. With several sessions running you get a
+picker, or target one with `bach clip --to <name>` / `$BACH_SESSION`.
+
+The directory is removed on session exit only if it's empty; anything left
+in it survives for 7 days after the session ends, then gets reaped by a
+later bach invocation.
 
 ## Source mode
 
@@ -416,6 +436,7 @@ to bounce services.
 ## Host paths
 
 ```
+~/.local/share/bach/shares/<session>/          # per-session RW share (/shared in container)
 ~/.local/share/bach/cache/mise/                # shared mise tool cache
 ~/.local/share/bach/cache/claude/              # cached claude binaries (auto-updated)
 ~/.local/share/bach/cache/projects/<proj>/     # per-project [[cache]] data

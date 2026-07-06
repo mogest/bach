@@ -47,6 +47,15 @@ CLAUDE_CACHE_HOST = BACH_DATA / "cache" / "claude"
 CLAUDE_DOWNLOAD_BASE = "https://downloads.claude.ai/claude-code-releases"
 PROJECTS_HOST = BACH_DATA / "projects"
 PORTS_STATE_FILE = BACH_STATE / "ports.json"
+# Per-session host<->container share dirs. Not under /tmp: Docker Desktop's
+# VirtioFS caches negative lookups there (a recreated /tmp/bach/<x> can stay
+# "does not exist" to the VM) and macOS's periodic temp cleaner could remove
+# a live session's dir. Lifecycle is bach's own instead: rmdir-if-empty on
+# session exit, and reap_share_dirs on every invocation drops dead sessions'
+# dirs (empty immediately, non-empty after SHARE_KEEP_DAYS).
+SHARE_BASE = BACH_DATA / "shares"
+SHARE_MOUNT = "/shared"
+SHARE_KEEP_DAYS = 7
 # Range pre-published on the bach-proxy container at startup. Session
 # containers live on --internal networks (Docker silently no-ops port
 # publishing there), so host->container traffic enters via the dual-homed
@@ -1460,6 +1469,15 @@ otherwise the user has no way to see it.
 ## Clipboard
 
 `pbcopy` is available and writes to the user's macOS clipboard via OSC 52 (e.g. `echo foo | pbcopy`).
+
+## Shared directory
+
+`/shared` is a per-session scratch directory shared read-write with the user's host. It is the only
+filesystem path the user can browse from their machine, so whenever you produce a file the user should view
+outside the container — reports, images, diagrams, rendered output, patches — write it to `/shared` and tell
+the user its filename. The reverse also works: `bach clip` on the host saves the user's clipboard (text or
+image) as a file in `/shared` and hands them the path to paste to you, so treat `/shared/clip-*` paths you
+receive as user-provided input files.
 """
 
 
@@ -1638,6 +1656,26 @@ def build_aliases(cfg: dict) -> str:
         lines.append(f"alias {k}='{esc}'")
     return "\n".join(lines)
 
+def reap_share_dirs(running_sessions: set[str]) -> None:
+    """Drop share dirs whose session is no longer running: empty ones
+    immediately, non-empty ones (files the user may not have collected yet)
+    once untouched for SHARE_KEEP_DAYS."""
+    if not SHARE_BASE.is_dir():
+        return
+    cutoff = time.time() - SHARE_KEEP_DAYS * 86400
+    for d in SHARE_BASE.iterdir():
+        if not d.is_dir() or d.name in running_sessions:
+            continue
+        try:
+            empty = next(d.iterdir(), None) is None
+        except OSError:
+            continue
+        if empty:
+            with contextlib.suppress(OSError):
+                d.rmdir()
+        elif d.stat().st_mtime < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+
 # ---------- session ----------
 
 def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend, *, guard: bool = False, no_publish: bool = False) -> None:
@@ -1713,6 +1751,15 @@ def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend,
         "-e", f"NO_PROXY={no_proxy}",
         "-e", f"no_proxy={no_proxy}",
     ]
+
+    # Per-session share dir, mounted RW at /shared. World-writable rather than
+    # chowned: VirtioFS preserves the host uid on bind mounts, so 0777 is the
+    # only mode that lets both the host user (bach clip) and agent/1000 write.
+    share_dir = SHARE_BASE / session_name
+    share_dir.mkdir(parents=True, exist_ok=True)
+    share_dir.chmod(0o777)
+    print(f"bach: shared dir {share_dir} -> {SHARE_MOUNT}")
+    cmd += ["--mount", f"type=bind,source={share_dir},target={SHARE_MOUNT}"]
 
     if use_clone:
         origin = to_https_remote(subprocess.run(
@@ -1918,6 +1965,10 @@ def run_container_with_cleanup(
             post_forwards_to_proxy(root.name, forwards)
         except Exception:
             pass
+        # Reclaim the share dir only when nothing was left in it for the user;
+        # non-empty dirs stay until reap_share_dirs ages them out.
+        with contextlib.suppress(OSError):
+            (SHARE_BASE / session_name).rmdir()
         restore_window_title(title_state)
 
     sys.exit(rc)
@@ -2046,6 +2097,76 @@ def cmd_exec(backend: Backend, args: list[str]) -> None:
         restore_window_title(title_state)
     sys.exit(rc)
 
+# ---------- clipboard -> shared dir ----------
+
+def _write_clipboard_image(share: pathlib.Path, stem: str) -> pathlib.Path | None:
+    """Save a clipboard image into `share` via osascript. Tries PNG first
+    (screenshots), then TIFF (images copied from apps that only offer TIFF).
+    Returns the written path, or None if the clipboard holds no image."""
+    for cls, ext in (("PNGf", "png"), ("TIFF", "tiff")):
+        target = share / f"{stem}.{ext}"
+        # `target` is safe to embed: SHARE_BASE + a docker container name +
+        # our own stem, no quotes or backslashes possible.
+        script = (
+            f'set f to open for access POSIX file "{target}" with write permission\n'
+            "try\n"
+            f"    write (the clipboard as «class {cls}») to f\n"
+            "on error m\n"
+            "    close access f\n"
+            "    error m\n"
+            "end try\n"
+            "close access f"
+        )
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        if res.returncode == 0 and target.is_file() and target.stat().st_size > 0:
+            return target
+        target.unlink(missing_ok=True)
+    return None
+
+def cmd_clip(backend: Backend, args: list[str]) -> None:
+    """Save the host clipboard (image or text) into a running session's
+    /shared dir, then put the in-container path on the clipboard so the user
+    can paste it straight into claude."""
+    target_session = os.environ.get("BACH_SESSION")
+    i = 0
+    while i < len(args):
+        if args[i] in ("--to", "-t"):
+            if i + 1 >= len(args):
+                print("bach: --to needs a session name", file=sys.stderr)
+                sys.exit(2)
+            target_session = args[i + 1]
+            i += 2
+        else:
+            print(f"bach: clip: unexpected argument {args[i]!r}", file=sys.stderr)
+            sys.exit(2)
+    root, _ = find_project()
+    name = pick_session(backend, root, target_session)
+    share = SHARE_BASE / name
+    if not share.is_dir():
+        sys.exit(
+            f"bach: no shared dir at {share} — session predates shared-dir "
+            "support; start a fresh session"
+        )
+    stem = "clip-" + time.strftime("%Y%m%d-%H%M%S")
+    if list(share.glob(f"{stem}.*")):
+        stem += f"-{secrets.token_hex(2)}"
+
+    saved = _write_clipboard_image(share, stem)
+    kind = "image"
+    if saved is None:
+        text = subprocess.run(["pbpaste"], capture_output=True).stdout
+        if not text:
+            sys.exit("bach: clipboard is empty (or holds a type bach can't save)")
+        saved = share / f"{stem}.txt"
+        saved.write_bytes(text)
+        kind = "text"
+    saved.chmod(0o644)
+
+    container_path = f"{SHARE_MOUNT}/{saved.name}"
+    subprocess.run(["pbcopy"], input=container_path.encode())
+    print(f"bach: clipboard {kind} -> {saved}")
+    print(f"bach: copied {container_path} to clipboard — paste it into claude in {name}")
+
 HELP_TEXT = """\
 bach — sandboxed Claude Code in a container
 
@@ -2072,6 +2193,10 @@ SUBCOMMANDS
                           sessions and a TTY you get a picker; otherwise
                           target one with --to <name> or $BACH_SESSION.
   e                       Alias for exec.
+  clip [--to <name>]      Save the host clipboard (text or image) as a file in
+                          a running session's /shared dir, and copy the
+                          in-container path to the clipboard so it can be
+                          pasted straight into claude.
   ps                      List this project's running session containers.
 
   up                      Start the proxy + backend services from .bach.toml.
@@ -2148,6 +2273,10 @@ EXAMPLES
   bach up && bach status   # start services and inspect
 
 PATHS
+  ~/.local/share/bach/shares/<session>/  Per-session dir shared RW with the
+                                         container at /shared (bach clip
+                                         drops files here; removed on exit
+                                         if empty, else reaped after 7 days).
   ~/.local/share/bach/projects/<proj>/   Per-project Claude history.
   ~/.local/share/bach/cache/mise/        Shared mise tool cache.
   ~/.local/share/bach/cache/claude/      Cached claude binaries (mounted RO
@@ -2186,9 +2315,11 @@ def main() -> None:
     # handler didn't get to fire. Best-effort: a broken backend just means
     # the file stays as-is until the next successful invocation.
     try:
-        reap_ports(set(backend.list_all_running_sessions()))
+        running = set(backend.list_all_running_sessions())
+        reap_ports(running)
+        reap_share_dirs(running)
     except Exception as e:
-        print(f"bach: warning: port reap failed: {e}", file=sys.stderr)
+        print(f"bach: warning: port/share reap failed: {e}", file=sys.stderr)
 
     if args and args[0] == "up":
         net = project_id(root)
@@ -2216,6 +2347,8 @@ def main() -> None:
         cmd_build(backend, use_cache="--cache" in args[1:])
     elif args and args[0] in ("exec", "e"):
         cmd_exec(backend, args[1:])
+    elif args and args[0] == "clip":
+        cmd_clip(backend, args[1:])
     elif args and args[0] in ("shell", "s"):
         session(root, cfg, ["bash", "-l"], backend, guard=True, no_publish=no_publish)
     elif args and args[0] in ("claude", "c"):
