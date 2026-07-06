@@ -55,7 +55,7 @@ Walked up from `cwd`. Project root = the dir containing `.bach.toml` (or `cwd` i
 A user-level file at `$XDG_CONFIG_HOME/bach/config.toml` (default `~/.config/bach/config.toml`) is loaded first and the project's `.bach.toml` is layered on top. Same schema. Merge in `merge_configs()`:
 - Lists concat: `apt_packages`, `ports`, `allowlist`, `denylist`, `stage`, `mounts`, `cache`, `volumes`, `install`.
 - Tables merge by key, later wins per key: `env`, `aliases`. `services` is replace-by-name (collision = project's spec wins entirely, no deep merge).
-- Scalars last-wins (`image`, `mise_cache`, `claude_model`).
+- Scalars last-wins (`image`, `mise_cache`, `claude_model`, `notify_sound`).
 
 User-level-only scalars (one proxy serves all projects): `proxy_port`, `proxy_dash_port`, `proxy_hold_seconds` (pending-approval hold before rejection, default 10; read at startup, applied to the proxy container as `BACH_HOLD_SECS`).
 
@@ -65,6 +65,11 @@ User-level-only scalars (one proxy serves all projects): `proxy_port`, `proxy_da
 image = "bach:base"                                # override the session image
 mise_cache = true
 claude_model = "opus"                              # pin claude's default model; unset (default) = claude's own default
+notify_sound = "Ping"                              # macOS system sound name (or audio file path) played by the host-side
+                                                   # bach process when the proxy holds a request pending approval.
+                                                   # Unset (default) = silent. One notifier across concurrent sessions
+                                                   # (flock on ~/.local/state/bach/notify.lock); daemon thread follows
+                                                   # the dashboard SSE stream, afplay via argv (never a shell).
 
 # Forwarded ports. bach auto-assigns a host port (starting at 4100) per
 # named entry; the proxy dashboard shows the assigned URL. Allocations are

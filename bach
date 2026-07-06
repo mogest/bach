@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import fcntl
 import threading
 import hashlib
@@ -92,7 +93,7 @@ def merge_configs(base: dict, override: dict) -> dict:
 
 _TOP_SCALARS = {
     "image": str, "claude_model": str, "source_mode": str, "backend": str,
-    "mise_cache": bool,
+    "mise_cache": bool, "notify_sound": str,
 }
 _USER_ONLY_SCALARS = {"proxy_port": int, "proxy_dash_port": int, "proxy_hold_seconds": int}
 _TOP_STR_LISTS = ("apt_packages", "allowlist", "denylist", "volumes")
@@ -392,6 +393,108 @@ def build_forwards(allocations: list[dict], project: str, ip_lookup) -> list[dic
             "container_port": a["container_port"],
         })
     return out
+
+
+# ---------- pending-request sound ----------
+
+SYSTEM_SOUNDS_DIR = pathlib.Path("/System/Library/Sounds")
+NOTIFY_LOCK_FILE = BACH_STATE / "notify.lock"
+NOTIFY_MIN_INTERVAL = 2.0  # pendings arrive in bursts; don't machine-gun afplay
+
+def resolve_notify_sound(cfg: dict) -> pathlib.Path | None:
+    """Map `notify_sound` to a playable file, or None for no sound (the
+    default). A bare name ("Ping") resolves to the macOS system sound of
+    that name; a value containing a path separator (or starting with ~) is
+    a path to an audio file. The result is only ever passed to afplay as an
+    argv element — never through a shell — so no quoting can break out."""
+    name = cfg.get("notify_sound")
+    if not name:
+        return None
+    if "/" in name or name.startswith("~"):
+        p = pathlib.Path(os.path.expanduser(name))
+    elif re.fullmatch(r"[A-Za-z0-9 ._-]+", name):
+        p = SYSTEM_SOUNDS_DIR / f"{name}.aiff"
+    else:
+        print(f"bach: warning: ignoring invalid notify_sound {name!r}", file=sys.stderr)
+        return None
+    if not p.is_file():
+        print(f"bach: warning: notify_sound file not found: {p}", file=sys.stderr)
+        return None
+    return p
+
+def _parse_event_time(ts: str) -> datetime.datetime | None:
+    # Go marshals time.Time as RFC3339Nano; strip the variable-width
+    # fractional seconds fromisoformat can choke on.
+    ts = re.sub(r"\.\d+", "", ts).replace("Z", "+00:00")
+    try:
+        return datetime.datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+def _follow_pending_events(sound: pathlib.Path) -> None:
+    """Follow the proxy's SSE stream once, playing `sound` for each held
+    (pending) request. Returns when the connection drops. No read timeout:
+    the stream is silent between events, and a proxy restart closes the
+    socket properly."""
+    hold_window = datetime.timedelta(seconds=max(PROXY_HOLD_SECONDS, 1))
+    last_play = 0.0
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PROXY_DASH_PORT}/events") as resp:
+            for raw in resp:
+                if not raw.startswith(b"data: "):
+                    continue
+                try:
+                    event = json.loads(raw[6:])
+                except ValueError:
+                    continue
+                if event.get("status") != "pending":
+                    continue
+                # /events replays recent history on connect. A replayed event
+                # still marked pending and younger than the hold window is
+                # (very likely) still being held — sound it, so a notifier
+                # taking over the flock mid-hold doesn't miss it. Anything
+                # older has been resolved (resolution updates the status).
+                ts = _parse_event_time(event.get("timestamp", ""))
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                if ts is None or ts < now_utc - hold_window:
+                    continue
+                now = time.monotonic()
+                if now - last_play < NOTIFY_MIN_INTERVAL:
+                    continue
+                last_play = now
+                subprocess.Popen(
+                    ["afplay", str(sound)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+    except OSError:
+        return
+
+def _notify_thread_body(sound: pathlib.Path) -> None:
+    # One notifier across all concurrent sessions: whoever holds the flock
+    # watches (for every project — pendings are host-wide news); the rest
+    # retry so the role fails over when the holding session exits. The
+    # takeover gap (retry interval + reconnect) is covered by the SSE
+    # replay: still-pending events inside the hold window sound on connect.
+    lock = open(NOTIFY_LOCK_FILE, "w")
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            time.sleep(5)
+            continue
+        _follow_pending_events(sound)
+        time.sleep(2)  # proxy gone or restarting; reconnect
+
+def start_notify_thread(cfg: dict) -> None:
+    """Play `notify_sound` whenever the proxy holds a request pending
+    approval. Runs as a daemon thread inside the session's foreground bach
+    process — its lifetime is exactly the window in which pendings can
+    occur, so there's no separate daemon to manage."""
+    sound = resolve_notify_sound(cfg)
+    if sound is None or not shutil.which("afplay"):
+        return
+    BACH_STATE.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=_notify_thread_body, args=(sound,), daemon=True).start()
 
 
 # ---------- shell helpers ----------
@@ -1771,6 +1874,7 @@ def run_container_with_cleanup(
         post_forwards_to_proxy(root.name, forwards)
 
     threading.Thread(target=_post_forwards_when_ready, daemon=True).start()
+    start_notify_thread(cfg)
 
     # SIGINT (Ctrl-C) goes to the whole foreground process group, so docker
     # already receives it directly — don't double-forward. SIGTERM/SIGHUP

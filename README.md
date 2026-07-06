@@ -204,6 +204,9 @@ source_mode = "auto"                # auto (default) | clone | bind. See *Source
 image = "bach:base"                 # override the base image
 mise_cache = true                   # share host mise tool cache (default true)
 claude_model = "opus"               # pin claude's default model (unset = claude's own default)
+notify_sound = "Ping"               # play this macOS system sound (or an audio file
+                                    # path) when the proxy holds a request pending
+                                    # approval (unset = silent, the default)
 
 # Forwarded ports. bach auto-assigns a host port (first free from 4100
 # upwards) per named entry and the proxy dashboard renders a clickable
@@ -315,7 +318,7 @@ Merge rules:
 - Tables merge by key, later wins per key: `env`, `aliases`. `[services.<name>]`
   is replace-by-name (project-level service spec fully replaces user-level one
   with the same name; no deep merge of `env`/`volumes`/...).
-- Scalars last-wins: `image`, `mise_cache`, `claude_model`.
+- Scalars last-wins: `image`, `mise_cache`, `claude_model`, `notify_sound`.
 
 A few settings are user-level only because one proxy serves every project:
 `proxy_port`, `proxy_dash_port`, and `proxy_hold_seconds` (how long an
