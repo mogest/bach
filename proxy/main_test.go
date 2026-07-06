@@ -28,6 +28,15 @@ func resetProjects(name string, patterns []string) func() {
 	return func() { projectStore = prev }
 }
 
+// resetTempDeny swaps in a fresh tempDenyStore (timed-out holds plant
+// entries in the global one, which would leak between tests). Returns a
+// cleanup that restores the previous store.
+func resetTempDeny() func() {
+	prev := tempDenyStore
+	tempDenyStore = NewTemporaryAllowStore()
+	return func() { tempDenyStore = prev }
+}
+
 // reqAs builds a request with RemoteAddr set so projectFromRemote can match.
 func reqAs(method, url, remote string) *http.Request {
 	r := httptest.NewRequest(method, url, nil)
@@ -169,6 +178,7 @@ func TestApprovalIsProjectScoped(t *testing.T) {
 	// host X for project A must not release a pending request for
 	// host X from project B.
 	defer resetProjects("a", nil)()
+	defer resetTempDeny()()
 
 	origDuration := holdDuration
 	holdDuration = 200 * time.Millisecond
@@ -214,6 +224,131 @@ func TestTemporaryAllowExpiry(t *testing.T) {
 
 	if tempAllowStore.IsAllowed("expiry-test.example.com") {
 		t.Error("expected host to be expired after waiting past duration")
+	}
+}
+
+func TestHoldTimeoutTempDenies(t *testing.T) {
+	defer resetProjects("p", nil)()
+	defer resetTempDeny()()
+
+	origResolve := resolveAndValidate
+	resolveAndValidate = func(host string) (string, error) { return host, nil }
+	defer func() { resolveAndValidate = origResolve }()
+
+	origHold := holdDuration
+	holdDuration = 50 * time.Millisecond
+	defer func() { holdDuration = origHold }()
+
+	// First request rides out the full hold and times out.
+	w := httptest.NewRecorder()
+	handleHTTP(w, reqAs("GET", "http://tempdeny.example.com/", testRemote))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("first request: got status %d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	// A retry for the same host is rejected immediately — no second hold.
+	start := time.Now()
+	w = httptest.NewRecorder()
+	handleHTTP(w, reqAs("GET", "http://tempdeny.example.com/", testRemote))
+	elapsed := time.Since(start)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("retry: got status %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if elapsed > 25*time.Millisecond {
+		t.Errorf("retry took %v, expected immediate rejection (no pending hold)", elapsed)
+	}
+}
+
+func TestTempDenyExpiryRestartsPending(t *testing.T) {
+	defer resetProjects("p", nil)()
+	defer resetTempDeny()()
+
+	origResolve := resolveAndValidate
+	resolveAndValidate = func(host string) (string, error) { return host, nil }
+	defer func() { resolveAndValidate = origResolve }()
+
+	origHold := holdDuration
+	holdDuration = 100 * time.Millisecond
+	defer func() { holdDuration = origHold }()
+
+	origDeny := tempDenyDuration
+	tempDenyDuration = 50 * time.Millisecond
+	defer func() { tempDenyDuration = origDeny }()
+
+	// Time out a hold to plant the temp-deny, then let it expire.
+	w := httptest.NewRecorder()
+	handleHTTP(w, reqAs("GET", "http://denyexpiry.example.com/", testRemote))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("first request: got status %d, want %d", w.Code, http.StatusForbidden)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// The next request must start a fresh pending period (held for the
+	// full holdDuration), not be insta-rejected.
+	start := time.Now()
+	w = httptest.NewRecorder()
+	handleHTTP(w, reqAs("GET", "http://denyexpiry.example.com/", testRemote))
+	elapsed := time.Since(start)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("got status %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if elapsed < 80*time.Millisecond {
+		t.Errorf("request resolved in %v, expected a fresh pending hold of ~%v", elapsed, holdDuration)
+	}
+}
+
+func TestTemporaryAllowExpiryRestartsPending(t *testing.T) {
+	defer resetProjects("p", nil)()
+	defer resetTempDeny()()
+
+	origResolve := resolveAndValidate
+	resolveAndValidate = func(host string) (string, error) { return host, nil }
+	defer func() { resolveAndValidate = origResolve }()
+
+	origHold := holdDuration
+	holdDuration = 100 * time.Millisecond
+	defer func() { holdDuration = origHold }()
+
+	// An expired temp-allow must fall back to a fresh pending period, not a
+	// rejection.
+	tempAllowStore.AllowFor(tempAllowKey("p", "allowexpiry.example.com"), 10*time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
+
+	start := time.Now()
+	w := httptest.NewRecorder()
+	handleHTTP(w, reqAs("GET", "http://allowexpiry.example.com/", testRemote))
+	elapsed := time.Since(start)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("got status %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if elapsed < 80*time.Millisecond {
+		t.Errorf("request resolved in %v, expected a fresh pending hold of ~%v", elapsed, holdDuration)
+	}
+	if tempAllowStore.IsAllowed(tempAllowKey("p", "allowexpiry.example.com")) {
+		t.Error("expired temp-allow still present")
+	}
+}
+
+func TestApprovalClearsTempDeny(t *testing.T) {
+	defer resetTempDeny()()
+
+	host := "cleardeny.example.com"
+	project := "p"
+	tempDenyStore.AllowFor(tempAllowKey(project, host), time.Minute)
+
+	req := httptest.NewRequest("POST", "/approve?project="+project+"&host="+host, nil)
+	req.Header.Set("X-CSRF-Token", csrfToken)
+	w := httptest.NewRecorder()
+	handleApprove(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got status %d, want %d", w.Code, http.StatusOK)
+	}
+	if tempDenyStore.IsAllowed(tempAllowKey(project, host)) {
+		t.Error("approval should clear the temp-deny entry")
+	}
+	if !tempAllowStore.IsAllowed(tempAllowKey(project, host)) {
+		t.Error("approval should add a temp-allow entry")
 	}
 }
 
@@ -429,6 +564,7 @@ func TestHandlePorts(t *testing.T) {
 
 func TestHandleHTTP_Blocked(t *testing.T) {
 	defer resetProjects("p", nil)()
+	defer resetTempDeny()()
 
 	origResolve := resolveAndValidate
 	resolveAndValidate = func(host string) (string, error) { return host, nil }
@@ -485,6 +621,7 @@ func TestHandleHTTP_Allowed(t *testing.T) {
 
 func TestConnectBlocked(t *testing.T) {
 	defer resetProjects("p", nil)()
+	defer resetTempDeny()()
 
 	origResolve := resolveAndValidate
 	resolveAndValidate = func(host string) (string, error) { return host, nil }
@@ -590,6 +727,7 @@ func TestConnectAllowed(t *testing.T) {
 
 func TestPendingToRejectedFlow(t *testing.T) {
 	defer resetProjects("p", nil)()
+	defer resetTempDeny()()
 
 	origResolve := resolveAndValidate
 	resolveAndValidate = func(host string) (string, error) { return host, nil }

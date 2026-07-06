@@ -19,8 +19,9 @@ import (
 	"time"
 )
 
-var holdDuration = 5 * time.Second
+var holdDuration = 10 * time.Second
 var tempAllowDuration = 10 * time.Minute
+var tempDenyDuration = 60 * time.Second
 var maxSubscribers = 32
 
 var proxyTransport = &http.Transport{
@@ -92,9 +93,13 @@ func NewTemporaryAllowStore() *TemporaryAllowStore {
 }
 
 func (s *TemporaryAllowStore) Allow(host string) time.Time {
+	return s.AllowFor(host, tempAllowDuration)
+}
+
+func (s *TemporaryAllowStore) AllowFor(host string, d time.Duration) time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	exp := time.Now().Add(tempAllowDuration)
+	exp := time.Now().Add(d)
 	s.hosts[host] = exp
 	return exp
 }
@@ -133,6 +138,13 @@ func (s *TemporaryAllowStore) Snapshot() map[string]time.Time {
 }
 
 var tempAllowStore = NewTemporaryAllowStore()
+
+// tempDenyStore records project|host keys whose pending hold timed out.
+// Membership means "nobody was at the dashboard just now" — further requests
+// for the same host are rejected immediately instead of re-held, until the
+// entry expires (tempDenyDuration) and a fresh pending period can start.
+// A dashboard approval clears the entry (and temp-allow wins anyway).
+var tempDenyStore = NewTemporaryAllowStore()
 
 var allowedPorts = map[string]bool{
 	"443": true,
@@ -667,7 +679,10 @@ func validateAndAuthorize(w http.ResponseWriter, r *http.Request, method, host, 
 	// Denylist is checked AFTER temp-allow so a user-issued approval via the
 	// dashboard still overrides the project's denylist.
 	denied := !allowed && !tempAllowed && matchesPatterns(denylist, hostPort)
-	log.Printf("%s project=%s host=%s allowed=%t temp_allowed=%t denied=%t", method, projName, host, allowed, tempAllowed, denied)
+	// A recent pending hold for this host timed out unanswered; reject
+	// retries immediately instead of re-holding each one.
+	tempDenied := !allowed && !tempAllowed && !denied && tempDenyStore.IsAllowed(tempAllowKey(projName, host))
+	log.Printf("%s project=%s host=%s allowed=%t temp_allowed=%t denied=%t temp_denied=%t", method, projName, host, allowed, tempAllowed, denied, tempDenied)
 
 	if allowed || tempAllowed {
 		status := "allowed"
@@ -675,7 +690,7 @@ func validateAndAuthorize(w http.ResponseWriter, r *http.Request, method, host, 
 			status = "temp_allowed"
 		}
 		eventStore.Add(mkEvent(nextEventID(), status))
-	} else if denied {
+	} else if denied || tempDenied {
 		// Skip the pending hold — user can still issue an approval from the
 		// dashboard at any time, which lands as a temp-allow on the next request.
 		eventStore.Add(mkEvent(nextEventID(), "rejected"))
@@ -696,6 +711,9 @@ func validateAndAuthorize(w http.ResponseWriter, r *http.Request, method, host, 
 				return ""
 			}
 		case <-time.After(holdDuration):
+			// Unanswered hold: nobody is at the dashboard, so don't re-hold
+			// every retry for this host — temp-deny it for a while.
+			tempDenyStore.AllowFor(tempAllowKey(projName, host), tempDenyDuration)
 			eventStore.Update(evtID, "rejected")
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return ""
@@ -828,6 +846,7 @@ func handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	exp := tempAllowStore.Allow(tempAllowKey(project, host))
+	tempDenyStore.Revoke(tempAllowKey(project, host))
 	pendingStore.ApproveHost(project, host)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int64{"expires_at": exp.UnixMilli()})
@@ -1123,6 +1142,11 @@ func loadConfig() {
 	if v := os.Getenv("BACH_TEMP_ALLOW_SECS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			tempAllowDuration = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("BACH_TEMP_DENY_SECS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			tempDenyDuration = time.Duration(n) * time.Second
 		}
 	}
 	raw := os.Getenv("BACH_DASH_ALLOW_CIDR")

@@ -94,7 +94,7 @@ _TOP_SCALARS = {
     "image": str, "claude_model": str, "source_mode": str, "backend": str,
     "mise_cache": bool,
 }
-_USER_ONLY_SCALARS = {"proxy_port": int, "proxy_dash_port": int}
+_USER_ONLY_SCALARS = {"proxy_port": int, "proxy_dash_port": int, "proxy_hold_seconds": int}
 _TOP_STR_LISTS = ("apt_packages", "allowlist", "denylist", "volumes")
 # key -> ({field: type}, {required fields})
 _TOP_TABLE_ARRAYS = {
@@ -217,16 +217,20 @@ def load_user_config() -> dict:
         return {}
     return load_validated_toml(USER_CONFIG_PATH, user_level=True)
 
-# Proxy ports are intentionally user-level only — one proxy serves all
-# projects, so it must bind the same ports regardless of which project
+# Proxy settings are intentionally user-level only — one proxy serves all
+# projects, so it must run the same config regardless of which project
 # spawned it. Read from the user config (not the merged config) so a
 # project's `.bach.toml` can't accidentally desynchronise the proxy
 # listener from the HTTP_PROXY URL handed to session containers.
-def _load_proxy_ports() -> tuple[int, int]:
+def _load_proxy_settings() -> tuple[int, int, int]:
     cfg = load_user_config()
-    return int(cfg.get("proxy_port", 8080)), int(cfg.get("proxy_dash_port", 8081))
+    return (
+        int(cfg.get("proxy_port", 8080)),
+        int(cfg.get("proxy_dash_port", 8081)),
+        max(0, int(cfg.get("proxy_hold_seconds", 10))),
+    )
 
-PROXY_PORT, PROXY_DASH_PORT = _load_proxy_ports()
+PROXY_PORT, PROXY_DASH_PORT, PROXY_HOLD_SECONDS = _load_proxy_settings()
 
 def find_project() -> tuple[pathlib.Path, dict]:
     cwd = pathlib.Path.cwd().resolve()
@@ -882,6 +886,7 @@ class DockerBackend(Backend):
         target_digest = self.image_digest(PROXY_IMAGE)
         target_range = f"{PORT_ALLOC_START}-{PORT_ALLOC_END}"
         target_ports = f"{PROXY_PORT}:{PROXY_DASH_PORT}"
+        target_hold = str(PROXY_HOLD_SECONDS)
         state = self.container_state(PROXY_CONTAINER)
         # Networks the proxy was attached to before recreation, so other
         # projects' running sessions don't lose proxy access when the proxy
@@ -893,6 +898,7 @@ class DockerBackend(Backend):
             current_digest = labels.get("bach.proxy.image_digest", "")
             current_range = labels.get("bach.proxy.port_range", "")
             current_ports = labels.get("bach.proxy.ports", "")
+            current_hold = labels.get("bach.proxy.hold_seconds", "")
             reason = ""
             if current_digest != target_digest:
                 reason = "image changed"
@@ -900,6 +906,8 @@ class DockerBackend(Backend):
                 reason = f"port range {current_range or '<unset>'} -> {target_range}"
             elif current_ports != target_ports:
                 reason = f"proxy/dash ports {current_ports or '<unset>'} -> {target_ports}"
+            elif current_hold != target_hold:
+                reason = f"hold seconds {current_hold or '<unset>'} -> {target_hold}"
             if reason:
                 nets = ((data.get("NetworkSettings") or {}).get("Networks") or {})
                 preserved_nets = [n for n in nets if n != INTERNET_NET]
@@ -917,12 +925,14 @@ class DockerBackend(Backend):
                 "--label", f"bach.proxy.image_digest={target_digest}",
                 "--label", f"bach.proxy.port_range={target_range}",
                 "--label", f"bach.proxy.ports={target_ports}",
+                "--label", f"bach.proxy.hold_seconds={target_hold}",
                 "-p", f"127.0.0.1:{PROXY_DASH_PORT}:{PROXY_DASH_PORT}",
                 "-p", f"127.0.0.1:{PORT_ALLOC_START}-{PORT_ALLOC_END}:{PORT_ALLOC_START}-{PORT_ALLOC_END}",
                 "-e", f"BACH_PROXY_LISTEN=:{PROXY_PORT}",
                 "-e", f"BACH_DASH_LISTEN=:{PROXY_DASH_PORT}",
                 "-e", f"BACH_DASH_ALLOW_CIDR={cidr}",
                 "-e", f"BACH_FORWARD_RANGE={target_range}",
+                "-e", f"BACH_HOLD_SECS={target_hold}",
                 PROXY_IMAGE,
             ])
         elif state == "stopped":

@@ -129,8 +129,9 @@ ready to go.
 
 Open the dashboard at **http://127.0.0.1:8081/** in a browser. When Claude
 (or anything in the sandbox) tries to reach a host that isn't on the
-project's allowlist, the request is held there for ~5 seconds waiting for
-your click. Approve it and it's allowed for 10 minutes; ignore it and it gets
+project's allowlist, the request is held there for ~10 seconds waiting for
+your click (configurable via `proxy_hold_seconds` in the user-level config).
+Approve it and it's allowed for 10 minutes; ignore it and it gets
 a 403. To stop approving the same hosts over and over, add them to
 `allowlist` in the project's `.bach.toml` (see below).
 
@@ -242,7 +243,7 @@ allowlist = [
 ]
 
 # Denylist: same pattern syntax as allowlist. Matching hosts are rejected
-# immediately (no 5-second pending hold). User can still allow them ad-hoc
+# immediately (no pending hold). User can still allow them ad-hoc
 # from the dashboard — manual approvals always override the denylist.
 denylist = [
   "*.tracker.example",
@@ -316,6 +317,11 @@ Merge rules:
   with the same name; no deep merge of `env`/`volumes`/...).
 - Scalars last-wins: `image`, `mise_cache`, `claude_model`.
 
+A few settings are user-level only because one proxy serves every project:
+`proxy_port`, `proxy_dash_port`, and `proxy_hold_seconds` (how long an
+unlisted request is held awaiting dashboard approval before rejection;
+default 10).
+
 Example — neovim in every session:
 
 ```toml
@@ -372,8 +378,12 @@ to bounce services.
   internet. The only egress is via `bach-proxy`.
 - **Proxy** (`bach-proxy`, Go, in `proxy/`): HTTP + CONNECT, per-project
   hostname allowlist enforced by source CIDR, DNS-rebinding protection (refuses
-  resolutions that hit private ranges), 5s pending-approval window, 10min
-  temp-allow on approval. Dashboard on `127.0.0.1:8081` (host-side only;
+  resolutions that hit private ranges), pending-approval window (default 10s,
+  `proxy_hold_seconds` in the user-level config), 10min
+  temp-allow on approval. If a hold times out unanswered, retries for that
+  host are rejected immediately for the next 60s instead of being re-held;
+  once a temp-allow expires the next request starts a fresh approval window.
+  Dashboard on `127.0.0.1:8081` (host-side only;
   containers can't reach it).
   A single dual-homed `bach-proxy` container sits on a shared `bach-internet`
   bridge plus every project network; reachable as `bach-proxy:8080` by DNS.
