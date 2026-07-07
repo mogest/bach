@@ -149,6 +149,9 @@ bach run pnpm install   # one-off command in a fresh session
 bach exec               # attach a shell to an already-running session
 bach exec ls /work      # one-off command in a running session
 bach paste              # host clipboard -> file in the session's /shared dir
+bach send <file>        # host file -> session's /shared dir (path on clipboard)
+bach recv               # pick a file from /shared -> host clipboard / Finder
+bach recv -w            # watch /shared, deliver every new file until ^C
 bach ps                 # list running sessions for this project
 bach up                 # start proxy + services from .bach.toml
 bach down               # stop this project's services
@@ -178,8 +181,18 @@ moment it's written.
 It works the other way too: `bach paste` saves your current clipboard — text
 or an image — as a file in a running session's `/shared`, then puts the
 in-container path (`/shared/paste-<timestamp>.png`) on your clipboard so you
-can paste it straight into claude. With several sessions running you get a
-picker, or target one with `bach paste --to <name>` / `$BACH_SESSION`.
+can paste it straight into claude. `bach send <file>` does the same for any
+host file. With several sessions running you get a picker, or target one
+with `--to <name>` / `$BACH_SESSION`.
+
+And for the return trip: `bach recv` picks a file from a running session's
+`/shared` (a picker when there's more than one) and delivers it your way:
+`-c` content onto your clipboard (text, images, PDFs; errors on other
+binary), `-f` a copy in your current directory (won't overwrite),
+`-F <filename>` a copy at that name, `-o` a reveal in Finder. With no flag
+it asks you per file (c/f/o). `bach recv -w` watches instead, delivering
+every new file as claude writes it until you ^C; `-1`/`--once` waits for
+just the first new file and exits.
 
 The directory is removed on session exit only if it's empty; anything left
 in it survives for 7 days after the session ends, then gets reaped by a

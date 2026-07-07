@@ -1476,8 +1476,11 @@ otherwise the user has no way to see it.
 filesystem path the user can browse from their machine, so whenever you produce a file the user should view
 outside the container — reports, images, diagrams, rendered output, patches — write it to `/shared` and tell
 the user its filename. The reverse also works: `bach paste` on the host saves the user's clipboard (text or
-image) as a file in `/shared` and hands them the path to paste to you, so treat `/shared/paste-*` paths you
-receive as user-provided input files.
+image) as a file in `/shared`, and `bach send <file>` copies any host file there — both hand the user the
+in-container path to paste to you, so treat `/shared/...` paths you receive as user-provided input files.
+The user can also fetch files from `/shared` with `bach recv`: it delivers a file straight to their
+clipboard, a copy on their host filesystem, or their file browser — either an existing file they pick,
+or, when watching (`bach recv -w`), every new file the moment you write it.
 """
 
 
@@ -2097,7 +2100,20 @@ def cmd_exec(backend: Backend, args: list[str]) -> None:
         restore_window_title(title_state)
     sys.exit(rc)
 
-# ---------- clipboard -> shared dir ----------
+# ---------- clipboard / files <-> shared dir ----------
+
+def _session_share(backend: Backend, target: str | None) -> tuple[str, pathlib.Path]:
+    """Pick a running session and return (name, host share dir), erroring
+    out if the session predates shared-dir support."""
+    root, _ = find_project()
+    name = pick_session(backend, root, target)
+    share = SHARE_BASE / name
+    if not share.is_dir():
+        sys.exit(
+            f"bach: no shared dir at {share} — session predates shared-dir "
+            "support; start a fresh session"
+        )
+    return name, share
 
 def _write_clipboard_image(share: pathlib.Path, stem: str) -> pathlib.Path | None:
     """Save a clipboard image into `share` via osascript. Tries PNG first
@@ -2139,14 +2155,7 @@ def cmd_paste(backend: Backend, args: list[str]) -> None:
         else:
             print(f"bach: paste: unexpected argument {args[i]!r}", file=sys.stderr)
             sys.exit(2)
-    root, _ = find_project()
-    name = pick_session(backend, root, target_session)
-    share = SHARE_BASE / name
-    if not share.is_dir():
-        sys.exit(
-            f"bach: no shared dir at {share} — session predates shared-dir "
-            "support; start a fresh session"
-        )
+    name, share = _session_share(backend, target_session)
     stem = "paste-" + time.strftime("%Y%m%d-%H%M%S")
     if list(share.glob(f"{stem}.*")):
         stem += f"-{secrets.token_hex(2)}"
@@ -2166,6 +2175,249 @@ def cmd_paste(backend: Backend, args: list[str]) -> None:
     subprocess.run(["pbcopy"], input=container_path.encode())
     print(f"bach: clipboard {kind} -> {saved}")
     print(f"bach: copied {container_path} to clipboard — paste it into claude in {name}")
+
+def cmd_send(backend: Backend, args: list[str]) -> None:
+    """Copy a host file into a running session's /shared dir, then put the
+    in-container path on the clipboard so the user can paste it straight
+    into claude. `bach paste` for files."""
+    target_session = os.environ.get("BACH_SESSION")
+    src: pathlib.Path | None = None
+    i = 0
+    while i < len(args):
+        if args[i] in ("--to", "-t"):
+            if i + 1 >= len(args):
+                print("bach: --to needs a session name", file=sys.stderr)
+                sys.exit(2)
+            target_session = args[i + 1]
+            i += 2
+        elif src is None and not args[i].startswith("-"):
+            src = pathlib.Path(args[i]).expanduser()
+            i += 1
+        else:
+            print(f"bach: send: unexpected argument {args[i]!r}", file=sys.stderr)
+            sys.exit(2)
+    if src is None:
+        print("bach: usage: bach send [--to <name>] <file>", file=sys.stderr)
+        sys.exit(2)
+    if not src.is_file():
+        sys.exit(f"bach: send: {src} is not a file")
+    name, share = _session_share(backend, target_session)
+    dest = share / src.name
+    if dest.exists():
+        dest = share / f"{src.stem}-{secrets.token_hex(2)}{src.suffix}"
+    shutil.copyfile(src, dest)
+    dest.chmod(0o644)
+    container_path = f"{SHARE_MOUNT}/{dest.name}"
+    subprocess.run(["pbcopy"], input=container_path.encode())
+    print(f"bach: {src} -> {dest}")
+    print(f"bach: copied {container_path} to clipboard — paste it into claude in {name}")
+
+# AppleScript clipboard classes for file types whose *content* can be put on
+# the macOS clipboard as-is. Everything else is either text (utf-8, no NULs)
+# or not clipboard-able.
+_CLIPBOARD_CLASSES = {
+    ".png": "PNGf", ".jpg": "JPEG", ".jpeg": "JPEG",
+    ".gif": "GIFf", ".tif": "TIFF", ".tiff": "TIFF",
+    ".pdf": "PDF ",
+}
+
+def _copy_file_content_to_clipboard(path: pathlib.Path) -> str | None:
+    """Put a file's content on the host clipboard. Returns a kind label
+    ("image"/"pdf"/"text") on success, None when the content isn't
+    clipboard-able."""
+    cls = _CLIPBOARD_CLASSES.get(path.suffix.lower())
+    if cls:
+        # AppleScript string escaping: only backslash and double-quote.
+        p = str(path).replace("\\", "\\\\").replace('"', '\\"')
+        script = f'set the clipboard to (read (POSIX file "{p}") as «class {cls}»)'
+        res = subprocess.run(["osascript", "-e", script], capture_output=True)
+        if res.returncode != 0:
+            return None
+        return "pdf" if cls == "PDF " else "image"
+    data = path.read_bytes()
+    if b"\x00" in data:
+        return None
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    subprocess.run(["pbcopy"], input=data)
+    return "text"
+
+def _prompt_delivery(path: pathlib.Path) -> str:
+    """Ask the user how to deliver a share-dir file. Only offered when no
+    -c/-f/-F/-o flag was given."""
+    if not sys.stdin.isatty():
+        sys.exit("bach: recv: no delivery flag and no TTY to ask; use -c, -f, -F <name> or -o")
+    while True:
+        try:
+            raw = input(
+                f"{path.name}: deliver to [c]lipboard, write [f]ile here, or [o]pen in Finder? "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            sys.exit(1)
+        if raw in ("c", "f", "o"):
+            return {"c": "clipboard", "f": "file", "o": "finder"}[raw]
+        print("invalid — c, f or o", file=sys.stderr)
+
+def _deliver_share_file(path: pathlib.Path, mode: str | None, dest: str | None = None) -> bool:
+    """Hand a share-dir file to the host. mode: "clipboard" puts the content
+    on the clipboard (False if it won't fit — binary), "file" copies it to
+    `dest` (or ./<name>, refusing to overwrite when the name wasn't explicit),
+    "finder" reveals it in Finder, None prompts the user."""
+    if mode is None:
+        mode = _prompt_delivery(path)
+    if mode == "clipboard":
+        kind = _copy_file_content_to_clipboard(path)
+        if kind:
+            print(f"bach: copied {kind} content of {path.name} to clipboard")
+            return True
+        print(
+            f"bach: recv: {path.name} has binary content that can't go on the clipboard; try -f or -o",
+            file=sys.stderr,
+        )
+        return False
+    if mode == "finder":
+        subprocess.run(["open", "-R", str(path)])
+        print(f"bach: revealed {path} in Finder")
+        return True
+    target = pathlib.Path(dest).expanduser() if dest else pathlib.Path.cwd() / path.name
+    if dest is None and target.exists():
+        print(f"bach: recv: {target} already exists; use -F <filename>", file=sys.stderr)
+        return False
+    shutil.copyfile(path, target)
+    print(f"bach: wrote {target}")
+    return True
+
+def _wait_size_stable(path: pathlib.Path) -> None:
+    """Let the writer finish: wait until the size holds still for a poll."""
+    size = -1
+    while True:
+        cur = path.stat().st_size
+        if cur == size:
+            return
+        size = cur
+        time.sleep(0.5)
+
+def _pick_share_file(name: str, share: pathlib.Path) -> pathlib.Path:
+    """Pick an existing file from the share dir, newest first. Mirrors
+    pick_session: auto-pick a lone file, fzf when available, else a numbered
+    prompt with substring matching."""
+    files = sorted(
+        (p for p in share.iterdir() if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not files:
+        sys.exit(f"bach: no files in /shared of {name} — use -w to wait for one")
+    if len(files) == 1:
+        return files[0]
+    if not sys.stdin.isatty():
+        print("bach: multiple files in /shared; run interactively to pick one:", file=sys.stderr)
+        for p in files:
+            print(f"  {p.name}", file=sys.stderr)
+        sys.exit(1)
+    byname = {p.name: p for p in files}
+    if shutil.which("fzf"):
+        proc = subprocess.run(
+            ["fzf", "--height=~40%", "--reverse", "--prompt=file> "],
+            input="\n".join(p.name for p in files) + "\n",
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        choice = proc.stdout.strip()
+        if proc.returncode != 0 or choice not in byname:
+            sys.exit(1)
+        return byname[choice]
+    print("files in /shared (newest first):", file=sys.stderr)
+    for i, p in enumerate(files, 1):
+        print(f"  {i}) {p.name}", file=sys.stderr)
+    while True:
+        try:
+            raw = input(f"pick [1-{len(files)} or substring]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            sys.exit(1)
+        if raw.isdigit() and 1 <= int(raw) <= len(files):
+            return files[int(raw) - 1]
+        matches = [p for p in files if raw and raw in p.name]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            print("ambiguous:", file=sys.stderr)
+            for p in matches:
+                print(f"  {p.name}", file=sys.stderr)
+        else:
+            print("invalid", file=sys.stderr)
+
+def cmd_recv(backend: Backend, args: list[str]) -> None:
+    """Pick a file from a running session's /shared dir (default), or watch
+    for new files (-w: every new file until ^C; -1/--once: just the first),
+    and deliver each via _deliver_share_file. -c = clipboard, -f = copy to
+    ./<name>, -F <filename> = copy to <filename>, -o = reveal in Finder;
+    with none of those the user is prompted per file."""
+    target_session = os.environ.get("BACH_SESSION")
+    mode: str | None = None  # None = prompt per file
+    dest: str | None = None
+    watch = None  # None (pick existing) | "watch" | "once"
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--to", "-t"):
+            if i + 1 >= len(args):
+                print("bach: --to needs a session name", file=sys.stderr)
+                sys.exit(2)
+            target_session = args[i + 1]
+            i += 2
+            continue
+        elif a in ("-c", "--clipboard"):
+            mode, dest = "clipboard", None
+        elif a == "-f":
+            mode, dest = "file", None
+        elif a == "-F":
+            if i + 1 >= len(args):
+                print("bach: -F needs a filename", file=sys.stderr)
+                sys.exit(2)
+            mode, dest = "file", args[i + 1]
+            i += 2
+            continue
+        elif a in ("-o", "--open"):
+            mode, dest = "finder", None
+        elif a in ("-w", "--watch"):
+            watch = "watch"
+        elif a in ("-1", "--once"):
+            watch = "once"
+        else:
+            print(f"bach: recv: unexpected argument {a!r}", file=sys.stderr)
+            sys.exit(2)
+        i += 1
+    name, share = _session_share(backend, target_session)
+
+    if watch is None:
+        path = _pick_share_file(name, share)
+        if not _deliver_share_file(path, mode, dest):
+            sys.exit(1)
+        return
+
+    seen = {p.name for p in share.iterdir() if p.is_file()}
+    if watch == "watch":
+        print(f"bach: watching /shared of {name} for new files — ^C to stop")
+    else:
+        print(f"bach: waiting for a new file in /shared of {name} — ^C to cancel")
+    try:
+        while True:
+            time.sleep(0.5)
+            fresh = [p for p in share.iterdir() if p.is_file() and p.name not in seen]
+            for p in sorted(fresh, key=lambda p: p.stat().st_mtime):
+                seen.add(p.name)
+                _wait_size_stable(p)
+                ok = _deliver_share_file(p, mode, dest)
+                if watch == "once":
+                    sys.exit(0 if ok else 1)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        sys.exit(0 if watch == "watch" else 1)
 
 HELP_TEXT = """\
 bach — sandboxed Claude Code in a container
@@ -2197,6 +2449,21 @@ SUBCOMMANDS
                           a running session's /shared dir, and copy the
                           in-container path to the clipboard so it can be
                           pasted straight into claude.
+  send [--to <name>] <file>
+                          Copy a host file into a running session's /shared
+                          dir and copy the in-container path to the clipboard.
+                          Like paste, but for a file.
+  recv [--to <name>] [-w|-1] [-c|-f|-F <filename>|-o]
+                          Fetch a file from a running session's /shared dir:
+                          pick from the existing files (default; picker when
+                          there's more than one), or watch for new files with
+                          -w/--watch (deliver every new file until ^C) or
+                          -1/--once (deliver just the first, then exit).
+                          Delivery: -c content to the clipboard (text, image,
+                          pdf; error on other binary), -f copy to ./<name>
+                          (won't overwrite), -F <filename> copy to <filename>,
+                          -o reveal in Finder. With none of those, you're
+                          asked per file (c/f/o).
   ps                      List this project's running session containers.
 
   up                      Start the proxy + backend services from .bach.toml.
@@ -2349,6 +2616,10 @@ def main() -> None:
         cmd_exec(backend, args[1:])
     elif args and args[0] == "paste":
         cmd_paste(backend, args[1:])
+    elif args and args[0] == "send":
+        cmd_send(backend, args[1:])
+    elif args and args[0] == "recv":
+        cmd_recv(backend, args[1:])
     elif args and args[0] in ("shell", "s"):
         session(root, cfg, ["bash", "-l"], backend, guard=True, no_publish=no_publish)
     elif args and args[0] in ("claude", "c"):
