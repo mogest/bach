@@ -1,4 +1,22 @@
 [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
 
 echo "bach: launching claude. Ctrl-Z to suspend, fg to resume, exit/Ctrl-D to leave."
-claude
+# Launch from the first prompt, not from this rcfile: commands run during
+# startup files execute in bash's own process group, so Ctrl-Z's SIGTSTP
+# would hit the shell too and wedge the session instead of suspending
+# claude back to a prompt. Then, at every prompt, leave the shell (ending
+# the container) once no job is left — i.e. claude exited rather than
+# being suspended. The throwaway `jobs` first is load-bearing: bash only
+# reaps a finished job's table entry when a jobs call has reported it, so
+# without the flush the test still sees claude's corpse and never exits.
+_bach_prompt() {
+    local rc=$?
+    if [ -z "${_bach_claude_started:-}" ]; then
+        _bach_claude_started=1
+        claude
+        rc=$?
+    fi
+    jobs > /dev/null
+    [ -n "$(jobs -p)" ] || exit "$rc"
+}
+PROMPT_COMMAND=_bach_prompt
