@@ -1475,8 +1475,8 @@ otherwise the user has no way to see it.
 `/shared` is a per-session scratch directory shared read-write with the user's host. It is the only
 filesystem path the user can browse from their machine, so whenever you produce a file the user should view
 outside the container — reports, images, diagrams, rendered output, patches — write it to `/shared` and tell
-the user its filename. The reverse also works: `bach clip` on the host saves the user's clipboard (text or
-image) as a file in `/shared` and hands them the path to paste to you, so treat `/shared/clip-*` paths you
+the user its filename. The reverse also works: `bach paste` on the host saves the user's clipboard (text or
+image) as a file in `/shared` and hands them the path to paste to you, so treat `/shared/paste-*` paths you
 receive as user-provided input files.
 """
 
@@ -1754,7 +1754,7 @@ def session(root: pathlib.Path, cfg: dict, command: list[str], backend: Backend,
 
     # Per-session share dir, mounted RW at /shared. World-writable rather than
     # chowned: VirtioFS preserves the host uid on bind mounts, so 0777 is the
-    # only mode that lets both the host user (bach clip) and agent/1000 write.
+    # only mode that lets both the host user (bach paste) and agent/1000 write.
     share_dir = SHARE_BASE / session_name
     share_dir.mkdir(parents=True, exist_ok=True)
     share_dir.chmod(0o777)
@@ -2123,7 +2123,7 @@ def _write_clipboard_image(share: pathlib.Path, stem: str) -> pathlib.Path | Non
         target.unlink(missing_ok=True)
     return None
 
-def cmd_clip(backend: Backend, args: list[str]) -> None:
+def cmd_paste(backend: Backend, args: list[str]) -> None:
     """Save the host clipboard (image or text) into a running session's
     /shared dir, then put the in-container path on the clipboard so the user
     can paste it straight into claude."""
@@ -2137,7 +2137,7 @@ def cmd_clip(backend: Backend, args: list[str]) -> None:
             target_session = args[i + 1]
             i += 2
         else:
-            print(f"bach: clip: unexpected argument {args[i]!r}", file=sys.stderr)
+            print(f"bach: paste: unexpected argument {args[i]!r}", file=sys.stderr)
             sys.exit(2)
     root, _ = find_project()
     name = pick_session(backend, root, target_session)
@@ -2147,7 +2147,7 @@ def cmd_clip(backend: Backend, args: list[str]) -> None:
             f"bach: no shared dir at {share} — session predates shared-dir "
             "support; start a fresh session"
         )
-    stem = "clip-" + time.strftime("%Y%m%d-%H%M%S")
+    stem = "paste-" + time.strftime("%Y%m%d-%H%M%S")
     if list(share.glob(f"{stem}.*")):
         stem += f"-{secrets.token_hex(2)}"
 
@@ -2193,7 +2193,7 @@ SUBCOMMANDS
                           sessions and a TTY you get a picker; otherwise
                           target one with --to <name> or $BACH_SESSION.
   e                       Alias for exec.
-  clip [--to <name>]      Save the host clipboard (text or image) as a file in
+  paste [--to <name>]     Save the host clipboard (text or image) as a file in
                           a running session's /shared dir, and copy the
                           in-container path to the clipboard so it can be
                           pasted straight into claude.
@@ -2274,7 +2274,7 @@ EXAMPLES
 
 PATHS
   ~/.local/share/bach/shares/<session>/  Per-session dir shared RW with the
-                                         container at /shared (bach clip
+                                         container at /shared (bach paste
                                          drops files here; removed on exit
                                          if empty, else reaped after 7 days).
   ~/.local/share/bach/projects/<proj>/   Per-project Claude history.
@@ -2347,8 +2347,8 @@ def main() -> None:
         cmd_build(backend, use_cache="--cache" in args[1:])
     elif args and args[0] in ("exec", "e"):
         cmd_exec(backend, args[1:])
-    elif args and args[0] == "clip":
-        cmd_clip(backend, args[1:])
+    elif args and args[0] == "paste":
+        cmd_paste(backend, args[1:])
     elif args and args[0] in ("shell", "s"):
         session(root, cfg, ["bash", "-l"], backend, guard=True, no_publish=no_publish)
     elif args and args[0] in ("claude", "c"):
